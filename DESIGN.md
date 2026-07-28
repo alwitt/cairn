@@ -15,9 +15,8 @@ Its clients are the sandboxed-execution services in the same family —
 volumes and never touch storage directly. Agents talk to `cairn`'s own MCP
 endpoint for all artifact operations.
 
-> **Status:** working design, captured mid-discussion. `cairn` is a **new,
-> standalone microservice** — *not* part of `multitool`, which is its first
-> *client*.
+> **Status:** working design. `cairn` is a **new, standalone microservice** —
+> *not* part of `multitool`, which is its first *client*.
 
 ---
 
@@ -104,11 +103,9 @@ whenever the volume is reaped.
 | `Name` | string, unique | How the agent refers to it. Charset restricted to `[A-Za-z0-9_-]`. |
 | `Description` | string, optional | Free-text. |
 | `VolumeName` | string | The associated volume's name — **derived from `ID`** (`<app-name>-<workspace ID>`) and **persisted** at workspace-create. See below. |
-| `State` | string enum | Workspace lifecycle. See §2.1.1. |
-| `VolumeState` | string enum | Associated volume's lifecycle. Independent axis from `State`. See §2.1.2. |
+| `VolumeState` | string enum | The workspace's **sole state** — whether its associated volume exists. See §2.1.1. |
 | `CreatedAt` | timestamp | — |
 | `UpdatedAt` | timestamp | — |
-| `PurgedAt` | timestamp, nullable | Set when the workspace reaches `PURGED`. **Deliberately named `PurgedAt`, not `DeletedAt`** — a `DeletedAt time.Time` field triggers GORM's soft-delete behavior, which we do not want. |
 
 **`VolumeName` is ID-derived and persisted (a convenience cache).** It is computed
 once as `<app-name>-<workspace ID>` at workspace-create and stored, so **no client
@@ -119,8 +116,8 @@ service-level object-key prefix below) that namespaces this deployment's volumes
 for `VolumeList` filtering.
 
 - **Why `ID`, not `Name`:** the ID is **immutable**, so the volume name is stable
-  across a workspace rename. This means rename **never touches the volume** — the
-  old `Name`-requires-`VolumeState=NONE` rename guard is **gone** (§2.1.1, §7.1).
+  across a workspace rename. Rename is therefore a **pure DB update** that never
+  touches the volume and needs no volume-state guard (§7.1).
 - **Existence is `VolumeState`, not null-ness:** `VolumeName` is **always
   populated** (present from create, even while `VolumeState = NONE`). It is a name
   cache, not an existence flag. **Reader contract: only mount `VolumeName` when
@@ -132,29 +129,18 @@ for `VolumeList` filtering.
 config** (same for every workspace); the `<ws-id>` segment of the key already
 isolates workspaces. Final object key = `<config prefix>/<workspace ID>/<random>`.
 
-#### 2.1.1 Workspace `State` enum
-`ACTIVE` → `PENDING_PURGE` → `PURGING` → `PURGED`
-
-| State | Meaning |
-|---|---|
-| `ACTIVE` | Defined and ready for operations. |
-| `PENDING_PURGE` | Marked for deletion; **queued** for the maintenance system, not yet being worked. |
-| `PURGING` | Maintenance system is **actively** purging it. |
-| `PURGED` | Purge complete (terminal). Row + associated data entries removed on the next cleanup round. |
-
-- The `PENDING_PURGE` / `PURGING` split lets the maintenance system cheaply tell
-  **waiting-work** from **in-flight-work** (and makes a post-crash `PURGING` row an
-  obvious resume/inspect signal).
-- **Guard:** a workspace can enter `PENDING_PURGE` **only from `ACTIVE` with
-  `VolumeState = NONE`** — it must have no live volume before it can be marked.
-
-#### 2.1.2 Workspace `VolumeState` enum
+#### 2.1.1 Workspace `VolumeState` enum (the sole state)
 `NONE` ⇄ `READY`
 
 | State | Meaning |
 |---|---|
-| `NONE` | No volume exists (workspace may still be `ACTIVE`). |
+| `NONE` | No volume exists. |
 | `READY` | Volume exists and is mountable. |
+
+A workspace's existence **is** its row: it exists (row present) or it doesn't (row
+deleted, §4.1). The only thing left to track is whether the workspace's **volume**
+exists, which is exactly `VolumeState`; deletion is a plain, atomic row delete
+(§4.1), not a state.
 
 **No transient `CREATING`/`DELETING` states.** Volume create and delete are
 **synchronous, blocking REST operations** (§4.2) — the call does not return until
@@ -162,27 +148,25 @@ Docker has actually created/removed the volume, so the DB column is only written
 **after** Docker succeeds. There is no window where the column claims a state
 Docker has not reached, and a failed op leaves the column at its prior value. (If
 create/delete latency ever becomes unacceptable, async transient states can be
-reintroduced — deferred until then.)
+added — deferred until then.)
 
-This is a **separate axis** from `State`: an `ACTIVE` workspace can have a volume
-in either state. See §4 for the operator-controlled lifecycle and the teardown
-guards, and §8.2.2 for reconciliation when Docker drifts from the column.
+See §4 for the operator-controlled lifecycle and the teardown guards, and §8.2.2
+for reconciliation when Docker drifts from the column.
 
 ### 2.2 Artifact
 
 | Field | Type | Notes |
 |---|---|---|
 | `ID` | string (ULID) | **Sortable** primary identity. |
-| `WorkspaceID` | string (UUID), FK | Parent workspace. Backs `list_artifacts`, the `(WorkspaceID, Name)` uniqueness constraint, and cascade-on-workspace-purge. Not derived from the object key. |
+| `WorkspaceID` | string (UUID), FK | Parent workspace. Backs `list_artifacts`, the `(WorkspaceID, Name)` uniqueness constraint, and `ON DELETE CASCADE` when the workspace row is deleted (§4.1). Not derived from the object key. |
 | `Name` | string, unique per workspace | Display name; how the agent refers to it. **No relationship to the object key.** |
 | `Description` | string, optional | Free-text. |
 | `ObjectKey` | string | The **complete** object key in the store. |
 | `MIMEType` | string | **Server-sniffed** content type (§6), stored on the row so `list`/`fetch` report it without a `HeadObject`. **Advisory metadata only** — a label/download-name hint, **not a security boundary** (serving forces `attachment`, §6/§6.5). Also set as the object's `Content-Type`. |
 | `Size` | int64 | Size in bytes (from `GetObjectStat` on the staging object, §6.1). |
-| `State` | string enum | Artifact lifecycle. See §2.2.1. |
+| `State` | string enum | `RECORDED` or `MISSING_OBJECT`. See §2.2.1. |
 | `CreatedAt` | timestamp | — |
 | `UpdatedAt` | timestamp | — |
-| `PurgedAt` | timestamp, nullable | Set when the artifact reaches `PURGED`. **Named `PurgedAt`, not `DeletedAt`**, to avoid GORM's soft-delete behavior (same as workspace, §2.1). |
 
 - `ObjectKey` is `<config prefix>/<ws-id>/<random>` — a **random suffix, not the
   name** — so **rename is a pure DB update** (no object move).
@@ -191,27 +175,22 @@ guards, and §8.2.2 for reconciliation when Docker drifts from the column.
 
 #### 2.2.1 Artifact `State` enum
 ```
-RECORDED ─────────────▶ PENDING_PURGE ─▶ PURGING ─▶ PURGED
-    │                        ▲
-    └──▶ MISSING_OBJECT ─────┘
+RECORDED ⇄ MISSING_OBJECT
 ```
 
 | State | Meaning |
 |---|---|
-| `RECORDED` | Registered and stored — the sole **live** state. |
-| `MISSING_OBJECT` | Data-consistency flag: the row's backing object is **gone** (§8.2.1 item 3). A **quarantine** state — not auto-remediated, preserves the metadata as evidence of the loss. Discoverable via the `list_artifacts` state-filter option (§7.1), and can still be moved to `PENDING_PURGE` so an operator can purge it. |
-| `PENDING_PURGE` | Marked for purging; **queued** for lifecycle management. |
-| `PURGING` | Lifecycle management is **actively** deleting it. |
-| `PURGED` | Purge complete (terminal); row removed on the next cleanup round. |
+| `RECORDED` | Registered and stored — the normal live state. |
+| `MISSING_OBJECT` | Data-consistency flag: the row's backing object is **gone** (§8.2.1). A **quarantine** state — not auto-remediated, preserves the metadata as evidence of the loss. Discoverable via the `list_artifacts` state-filter option (§7.1); an operator can then **delete** the row (§7.1). |
 
-- There is **no `PENDING` state.** The two-call upload (§6.1) defers the DB insert
+- **Purge is not a state.** Deleting an artifact is a plain **row delete** (§4.1,
+  §7.1). The object the row referenced is left in the store and reclaimed later as
+  an unassociated object by the object-reaping GC (§8.2.1, §8.3). This is the
+  **eventual-consistency** model: the DB is authoritative for what exists; the
+  object store is reconciled toward it.
+- There is **no `PENDING` state**. The two-call upload (§6.1) defers the DB insert
   until **after** `CopyObject`, so a row only ever appears already-committed as
-  `RECORDED` — no dangling pending rows by construction. The object/staging
-  reconciliation in §8.2.1 governs the **object/staging** lifecycle, not an
-  artifact row state.
-- Mirrors the workspace `PENDING_PURGE`/`PURGING` split (§2.1.1): the maintenance
-  system distinguishes queued from in-flight, and a post-crash `PURGING` row is a
-  resume/inspect signal.
+  `RECORDED` — no dangling pending rows by construction.
 
 ### 2.3 No tenancy / no ownership
 The service represents **no tenancy model** — no owner/user/org column, no user
@@ -255,13 +234,14 @@ resolves names.
 ## 4. Lifecycle & teardown
 
 ### 4.1 Workspace record
-- **Created** (REST) → DB row only, `State = ACTIVE`, `VolumeState = NONE`.
-- **Active** → has artifacts and/or a live volume (`VolumeState = READY`).
-- **Marked for deletion** (REST) → `State = PENDING_PURGE` (guard: only from
-  `ACTIVE` with `VolumeState = NONE`). The maintenance system then drives the
-  multi-phase purge (§8.3.3): `PURGING` → cascade artifacts → completion poll →
-  `PURGED`; the record and its data entries are removed on the next cleanup round
-  (§8.3.4).
+- **Created** (REST) → DB row only, `VolumeState = NONE`.
+- **Live** → has artifacts and/or a live volume (`VolumeState = READY`).
+- **Deleted** (REST) → the workspace **row is deleted** (guard: only when
+  `VolumeState = NONE`, §4.3), and its artifact rows go with it via
+  `ON DELETE CASCADE` — one atomic DB transaction, no object-store interaction. The
+  objects those artifacts referenced are left in the store and reclaimed later as
+  unassociated objects by the object-reaping GC (§8.2.1, §8.3). Likewise, deleting
+  an **artifact** is a plain row delete.
 
 ### 4.2 Named volume — created & destroyed by the **operator** via REST
 Volume lifecycle is **not** in the agent's control. This is deliberate: other
@@ -280,7 +260,7 @@ created and deleted **explicitly by the operator**.
   NONE`; on failure/refusal the column stays `READY`.
 
 Because both ops write the column **only after** Docker succeeds, `VolumeState`
-has no transient states (§2.1.2). Drift can still arise from *outside* the service
+has no transient states (§2.1.1). Drift can still arise from *outside* the service
 mutating Docker (a human `docker volume rm`, host pruning, an orphan from a prior
 incarnation) — reconciled in §8.2.
 
@@ -298,11 +278,12 @@ containers mounting volume  →  volume  →  workspace record
   not just running, containers). The DB cannot answer this because mounts come from
   multiple clients the service didn't launch. Docker is the **sole source of truth
   for volume in-use state.**
-- **`mark workspace for deletion` refuses unless `VolumeState = NONE`** (§2.1.1
-  guard — the volume must already be gone).
+- **`delete workspace` refuses unless `VolumeState = NONE`** (§2.1.1 guard — the
+  volume must already be gone, or deleting the row would orphan the Docker volume:
+  its name is ID-derived, so with no row §8.2.2 could never adopt it).
 - These are **refusals, not waits** — REST returns an error; the operator retries.
 - Operator tears down **bottom-up**: stop workloads → delete volume
-  (`VolumeState → NONE`) → mark workspace for deletion (`State → PENDING_PURGE`).
+  (`VolumeState → NONE`) → delete workspace (row removed).
 
 ### 4.4 Canonical mount path (`/mnt/cairn/ws`)
 Artifact paths only round-trip if **every** container that mounts a workspace
@@ -325,8 +306,7 @@ sidecar at that exact path, or no artifact operation works.
   volume is mounted at `/mnt/cairn/ws`."*
 - **Path contract.** Every agent-supplied artifact path is **absolute and under
   `/mnt/cairn/ws`**. cairn validates it (§7.5) and uses it **verbatim** in the
-  sidecar — no prefix translation, because the sidecar mounts at the same path. The
-  earlier `/mnt/cairn/ws/<path>` shorthand is replaced by `/mnt/cairn/ws/<path>` throughout.
+  sidecar — no prefix translation, because the sidecar mounts at the same path.
 
 ---
 
@@ -406,10 +386,10 @@ guarantee.
 2. **Register artifact from staging** (workspace by ID) — caller sends
    `staging_key` (+ name, description). Server:
    1. **Verify the staging key belongs to this workspace** — the key must carry the
-      `<staging-prefix>/<ws-id>` prefix for the target workspace. This replaces the
-      former HMAC check: because the staging key is server-generated and
-      workspace-scoped by construction (§8.1), a simple prefix match proves the key
-      was issued for *this* workspace and rejects a key aimed at another.
+      `<staging-prefix>/<ws-id>` prefix for the target workspace. Because the
+      staging key is server-generated and workspace-scoped by construction (§8.1), a
+      simple prefix match proves the key was issued for *this* workspace and rejects
+      a key aimed at another.
    2. **Enforce the single-PUT size cap** — `GetObjectStat` the staging object
       (goutils `S3Client.GetObjectStat` → `S3ObjectStat.Size`) and reject an
       over-cap object here, before any copy (§5.2). "Too big" is an error at this
@@ -545,20 +525,21 @@ bound PUT (§6.1) cannot guarantee.
 | Fetch workspace | Record + `VolumeState` (volume ready?) + the **estimated number of containers currently mounting** the workspace volume (from Docker's `RefCount` via `system/df`, §4.3; `-1` when unavailable). |
 | Rename workspace (`Name`) | Pure DB; **no volume guard**. The volume name is derived from the immutable `ID` (§2.1), so rename never affects the volume — safe even with a live, mounted volume. Object key is also ID-based, untouched. |
 | Update workspace `Description` | Pure DB; no guards. |
-| Mark workspace for deletion | Refuse unless `VolumeState = NONE`; flips the workspace to `PENDING_PURGE` only. The maintenance system picks it up from there and drives the cascade (§8.3.3). |
+| Delete workspace | Refuse unless `VolumeState = NONE` (§4.3); **deletes the workspace row**, cascading to its artifact rows (`ON DELETE CASCADE`) in one transaction. No object-store interaction — the freed objects are reclaimed later by the GC (§8.2.1). |
 | Create volume | Provision named volume (idempotent). |
 | Delete volume | **Refuse if mounted** (Docker-side check). |
+| **Reap unassociated objects** | Operator-triggered: **immediately launch the object-reaping `tasking` Task** (§8.3), optionally scoped to one workspace's key prefix. The same Task the maintenance loop launches periodically — exposed here so an operator can force prompt reclamation instead of waiting for the next sweep. |
 | **Generate staging PUT URL** | Caller supplies exact size + base64 SHA-256 (bound into the URL, §6.1 step 1); size cap may fail fast here. Pure object-store; returns `{url, staging_key}`; no DB. |
-| **Register artifact from staging** | §6.1 step 2. **Parent workspace must be `ACTIVE`** (§7.5) — refuse otherwise. |
+| **Register artifact from staging** | §6.1 step 2. **Parent workspace must exist** (§7.5) — refuse otherwise. |
 | List artifacts | Metadata only. A **state filter is a listing option**: by default only `RECORDED` is returned, but the caller may request other states (e.g. `MISSING_OBJECT` for triage, §8.2.1 item 3). The option — not a hardcoded filter — decides what is returned. |
 | Fetch artifact (opt. `?presign` GET URL) | Serves any artifact by ID; a `?presign` GET URL is only minted for a `RECORDED` artifact (a non-`RECORDED` artifact has no servable object), and is minted with `response-content-disposition=attachment` (§6.5). |
-| Delete artifact | **Marks** for deletion (`PENDING_PURGE`); valid from `RECORDED` **or** `MISSING_OBJECT` (§2.2.1); mechanism → maintenance system (§8.3.2); idempotent. |
-| Update artifact from staging | §6.3 (replaces the bytes/`ObjectKey`). **Parent workspace must be `ACTIVE`** (§7.5) — refuse otherwise. |
+| Delete artifact | **Deletes the artifact row** (from `RECORDED` or `MISSING_OBJECT`); no object-store interaction — the freed object is reclaimed later by the GC (§8.2.1). Idempotent (deleting an absent row is a no-op). |
+| Update artifact from staging | §6.3 (replaces the bytes/`ObjectKey`). **Parent workspace must exist** (§7.5) — refuse otherwise. |
 | Rename artifact (`Name`) | Pure DB; the object key is random-suffixed so it is untouched (§2.2). Uniqueness enforced by `(WorkspaceID, Name)`. |
 | Update artifact `Description` | Pure DB; no guards. |
 | **Load artifact → volume** | Object → volume (download). Shared data path with MCP `download_artifact` (§7.4). |
-| **Save artifact** (volume → object) | Creates a **new** artifact from a volume file. Fails if the name is already taken (uniqueness on `(WorkspaceID, Name)`). REST peer of MCP `upload_artifact` (§7.4). Parent workspace must be `ACTIVE` (§7.5). |
-| **Update artifact** (volume → object) | Replaces an **existing** artifact's bytes from a volume file (§6.3). Fails if the artifact does not exist. REST peer of MCP `update_artifact` (§7.4). Parent workspace must be `ACTIVE` (§7.5). |
+| **Save artifact** (volume → object) | Creates a **new** artifact from a volume file. Fails if the name is already taken (uniqueness on `(WorkspaceID, Name)`). REST peer of MCP `upload_artifact` (§7.4). Parent workspace must exist (§7.5). |
+| **Update artifact** (volume → object) | Replaces an **existing** artifact's bytes from a volume file (§6.3). Fails if the artifact does not exist. REST peer of MCP `update_artifact` (§7.4). Parent workspace must exist (§7.5). |
 
 ### 7.2 MCP API (agent; name-addressed)
 Resolve names→IDs at the handler, then everything downstream is ID/key-addressed.
@@ -572,9 +553,9 @@ uses.
 |---|---|
 | `list_artifacts` | List artifacts in a workspace. Same state-filter listing option as REST (§7.1): defaults to `RECORDED`, other states requestable. |
 | `download_artifact` | Object → volume. Presign **GET** (`attachment`, §6.5); sidecar mounts volume at `/mnt/cairn/ws` (§4.4), `curl -o /mnt/cairn/ws/<path>`. Read direction, single sidecar, no core-register step. **The destination directory must already exist** — the agent prepares it first (§7.5.1). |
-| `upload_artifact` | Volume → object, **new** artifact. **Two sidecars** (stat/hash then upload) in front of the staging + register core path, §6.4 / §7.3. Parent workspace must be `ACTIVE` (§7.5). |
-| `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same two-sidecar flow as upload (§6.4) but calls the **update** core function. Parent workspace must be `ACTIVE` (§7.5). |
-| `delete_artifact` | Marks an artifact for deletion (`PENDING_PURGE`); valid from `RECORDED` or `MISSING_OBJECT` (§2.2.1). |
+| `upload_artifact` | Volume → object, **new** artifact. **Two sidecars** (stat/hash then upload) in front of the staging + register core path, §6.4 / §7.3. Parent workspace must exist (§7.5). |
+| `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same two-sidecar flow as upload (§6.4) but calls the **update** core function. Parent workspace must exist (§7.5). |
+| `delete_artifact` | **Deletes the artifact row** (from `RECORDED` or `MISSING_OBJECT`); the object is reclaimed later by the GC (§8.2.1). Idempotent. |
 | `rename_artifact` | Updates an artifact's name (pure DB update). |
 | `list_workspaces` | Read-only. Lists workspaces the agent can use. |
 | `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether the volume is ready to mount) plus the **estimated number of containers currently mounting** the workspace volume (Docker `RefCount`, §4.3). |
@@ -609,7 +590,7 @@ and the object store, never the service (§5.1).
 pre-check and a different core function:
 - **Step 1 pre-check is existence, not availability** — update replaces an
   existing artifact, so it pre-checks (pre-sidecar, fail-fast) that an artifact by
-  that name **exists** in the workspace *and* the parent workspace is `ACTIVE`
+  that name **exists** in the workspace *and* the parent workspace exists
   (§7.5), rather than checking the name is free. Spending two sidecars only to have
   the core function reject an unknown/inactive target is wasteful; this fails
   before either sidecar runs.
@@ -626,10 +607,9 @@ RegisterArtifactFromStaging(ctx, workspace, name, staging_key, …) → (artifac
    ├── REST handler → thin HTTP shim (unmarshal → core → marshal)
    └── MCP upload   → calls core directly after the upload container exits
 ```
-Same DRY benefit as the abandoned callback design, but shared at the
-**function-call layer** — no auth/network/async cost, and sidecars never need to
-reach the service (their only outbound traffic is a transfer sidecar's object-store
-upload/download).
+The register/update core is shared at the **function-call layer** — no
+auth/network/async cost, and sidecars never need to reach the service (their only
+outbound traffic is a transfer sidecar's object-store upload/download).
 
 ### 7.4 Shared core, path-specific front-ends (REST ⇄ MCP)
 REST and MCP share the **register/update core** (§7.3) and the **presigned-URL +
@@ -653,13 +633,14 @@ the front-ends differ by more than addressing:
   §6.5); no stat step is needed for reads (a GET binds no size/hash up front).
 
 ### 7.5 Handler-level validation & preconditions (all volume-touching ops)
-- **Parent workspace must be `ACTIVE`** — every artifact create/update
+- **Parent workspace must exist** — every artifact create/update
   (`RegisterArtifactFromStaging`, `UpdateArtifactFromStaging`, and the
-  `upload_artifact` / `update_artifact` MCP tools that call them) refuses unless
-  the parent workspace `State = ACTIVE`. This stops new/replacement bytes from
-  landing in a workspace already `PENDING_PURGE` / `PURGING`, which would race the
-  purge cascade (§8.3.3) and strand fresh objects. Read paths
-  (`download_artifact`, list/fetch) are not gated on this.
+  `upload_artifact` / `update_artifact` MCP tools that call them) refuses unless the
+  parent workspace row is present. A workspace delete is an atomic row delete (§4.1),
+  so there is no half-deleted window to race: either the row is there (writes
+  allowed) or it's gone (writes fail with not-found, and the `(WorkspaceID, …)` FK
+  would reject the insert anyway). Read paths (`download_artifact`, list/fetch) are
+  not gated on this.
 - **Single-PUT size cap** — enforced by both core functions via a `GetObjectStat`
   on the staging object: `RegisterArtifactFromStaging` (§6.1 step 2.2) and
   `UpdateArtifactFromStaging` (§6.3), and therefore by both the `upload_artifact`
@@ -752,19 +733,20 @@ upload time (§6.4 TOCTOU).
 ## 8. Maintenance
 
 Maintenance is defined here as **what needs to be done**, not **how it is
-scheduled**. The service does **not** implement a scheduler/loop: the separate
-**`tasking`** workflow & task-execution engine (now at initial release) drives
-these jobs. This document only enumerates the maintainable aspects and their
-remedies.
+scheduled**. cairn runs its **own lightweight maintenance loop** that reconciles the
+DB against the two external systems it tracks, and offloads the one heavy, retriable
+job — object deletion — to the separate **`tasking`** task-execution engine as a
+fire-and-forget Task. Deletion is **decoupled** from
+artifact/workspace deletion entirely: purge is a plain row delete (§4.1), and the
+object store is continuously reconciled toward the DB. This document enumerates the
+maintainable aspects and their remedies; the loop's cadence is config.
 
-Two independent categories:
-- **§8.2 Data-consistency management** — reconcile the DB against the two external
-  systems it tracks: the **object store** (artifact objects — the dual-write
-  problem) and **Docker** (workspace volumes). Discipline: **ordering + async
-  reconciliation**, **not** distributed transactions.
-- **§8.3 Lifecycle management** — execute the *forward* purge path
-  (`PENDING_PURGE → PURGING → PURGED`, object deletion, row removal). Defined in a
-  later pass.
+Two categories:
+- **§8.2 Data-consistency management** — reconcile the DB against the **object
+  store** (artifact objects) and **Docker** (workspace volumes). Discipline:
+  **ordering + async reconciliation**, **not** distributed transactions.
+- **§8.3 Object reaping** — the `tasking` Task that reclaims unassociated objects,
+  plus the maintenance loop that launches it and reaps its terminal Tasks.
 
 ### 8.1 Single-bucket layout
 Staging and final storage share **one bucket** (multiple buckets would complicate
@@ -779,31 +761,40 @@ lifecycle-expiry rule as a backstop — cleanup is the service's responsibility.
 ### 8.2 Data-consistency management
 
 #### 8.2.1 Object-store reconciliation (DB ⇄ object store)
-Each job compares object-store contents against DB rows. All object deletions are
-gated by a **configurable grace period** — an object younger than the grace window
-may simply be an in-flight operation a moment from completing, so it is skipped.
+This is the **sole object-deleter** in the system — deletion is never tied to
+artifact/workspace deletion (those are plain row deletes, §4.1); instead the store
+is continuously reconciled toward the DB. Each job compares object-store contents
+against DB rows. All object deletions are gated by a **configurable grace period**
+that is **load-bearing**: because a purge-by-row-delete removes the row
+first, *every* freed object transits through "unassociated," and *every* in-flight
+upload is transiently unassociated too (the §6.1 copy→insert window; staging objects
+never map to a row at all). The grace window is what separates "in-flight, leave it"
+from "orphan, reclaim it," so it **must exceed the slowest upload's copy→insert gap**.
 
-1. **Aged staging objects** — a staging object still present under the staging
-   prefix means an upload/update aborted before its best-effort cleanup (§6.1
-   step 6). Remedy: **delete** it once older than the grace period.
+The two deletion directions (items 1–2) are **detection only** — the actual object
+deletes are executed by the object-reaping `tasking` Task (§8.3), which **re-validates
+at delete time** (an object flagged now may gain a backing row before the delete
+runs). Item 3 is a cairn-side DB update.
 
-2. **Aged final objects with no backing row** — a final-prefix object whose key is
-   referenced by no artifact row. Two causes, **one remedy**:
-   - *Failed register/update* — `CopyObject` succeeded but the insert/row-update
-     did not (§6.1 ordering: copy → insert; §6.3 update).
-   - *Update orphan* — the previous object after §6.3 flipped `ObjectKey` to a new
-     key.
-   Remedy: **delete** the object once older than the grace period.
+1. **Aged staging objects** — any object under the staging prefix (a staging key
+   never maps to an artifact row by construction) aged past the grace window: an
+   upload/update that aborted before its best-effort cleanup (§6.1 step 6).
+   Reclaimed by the reap Task.
+
+2. **Aged final objects with no backing row** — a final-prefix object referenced by
+   no artifact row, aged past grace. Causes: a **purged** artifact/workspace whose
+   row was deleted (§4.1) — the normal case now; a *failed register/update*
+   (`CopyObject` succeeded, insert/row-update did not); or an *update orphan* (§6.3
+   flipped `ObjectKey` to a new key). One remedy — reclaimed by the reap Task.
 
 3. **Artifact row with a missing object** — a `RECORDED` row whose `ObjectKey`
-   resolves to no object. Detected for free by the same join. This is a
-   **data-loss signal**, not routine garbage, so it is **not** auto-purged:
-   - Remedy: transition the row `RECORDED → MISSING_OBJECT` (§2.2.1) — a quarantine
-     that **preserves the metadata as evidence** and surfaces the incident. An
-     operator may then move it to `PENDING_PURGE`.
-   - Rows already in `PENDING_PURGE`/`PURGING` with a missing object are **not**
-     flagged — a missing object there is expected (the purge partially ran); that
-     belongs to lifecycle management (§8.3).
+   resolves to no object. Detected for free by the same join. A **data-loss
+   signal**, not routine garbage, so it is **not** auto-remediated: transition the
+   row `RECORDED → MISSING_OBJECT` (§2.2.1) — a quarantine that **preserves the
+   metadata as evidence** and surfaces the incident; an operator may then **delete**
+   the row (§7.1). (Guard the transition with the same grace window, so the reap
+   Task's flag→delete gap can't momentarily present a still-in-use object as
+   missing.)
 
 #### 8.2.2 Volume-state reconciliation (DB ⇄ Docker)
 `VolumeState` is a DB column but the volume is a Docker object; with synchronous
@@ -830,97 +821,76 @@ workspace's volume — reconciliation just `VolumeInspect`s the stored `VolumeNa
 (This is strictly safer than a name-derived scheme, which would shift under a
 rename.)
 
-### 8.3 Lifecycle management
-The forward purge path. Three operations, all idempotent and re-runnable (the
-external engine may retry any of them).
+### 8.3 Object reaping (async, via `tasking`)
+Purge deletes rows, never objects (§4.1). Object reclamation is a **single reusable
+`tasking` Task** — `reap-objects` — that enacts the deletions §8.2.1 detects. It is
+the only place an object is ever deleted, and it is deliberately **level-triggered**:
+each run re-derives the orphan set from current state, so a lost, failed, or crashed
+reap simply gets redone next run. That property is what lets these Tasks be **fire-and-forget and untracked**: no
+tracking tables, no attempt cap, no revive, no per-object bookkeeping.
 
-**Invariants relied on:**
-- **A state transition to the same state is legal and idempotent** — any workspace
-  or artifact state transition may target the row's *current* state, so the same
-  transition code can run more than once without error (`X → X` is a no-op, not a
-  violation). This is what makes every step below safe to retry and makes a
-  re-run of a partially-applied step converge rather than fail.
-- **Object delete is idempotent** — deleting a backing object treats
-  **404 / no-such-key as success**. This makes every purge step safe to re-run
-  and lets a `MISSING_OBJECT → PENDING_PURGE` artifact (§2.2.1 — object already
-  gone) purge cleanly instead of wedging. This idempotency is **load-bearing** for
-  the crash-recovery reset below.
-- **A workspace can only reach `PENDING_PURGE` with `VolumeState = NONE`** (§2.1.1
-  guard) — so workspace purge never has to deal with a live volume; the volume is
-  gone by the time purge runs.
-- Purging touches **the object store + the DB row only**. It never touches a
-  volume (artifacts live in the object store; the volume is disposable cache, §0,
-  and is already gone before a workspace purges).
+Only the **Task engine** is used — no Workflows, so cairn embeds `tasking`'s task
+client + scheduler + a receiver for the `reap-objects` queue, and needs neither the
+workflow engine nor its `notify` feedback wiring.
 
-#### 8.3.1 Crash recovery (maintenance-system init)
-Only the maintenance system ever sets `PURGING`. Therefore, on **cold init**, any
-artifact still in `PURGING` is by definition **orphaned** by a failed run (a live
-run would not be mid-init). Init resets **all `PURGING` artifacts back to
-`PENDING_PURGE`** so they are re-picked next round. Safe precisely because object
-delete is idempotent (above).
+#### 8.3.1 The `reap-objects` Task
+Self-contained, idempotent, parallel-safe. Optional parameter: a workspace ID to
+scope the sweep to one `<ws-id>` prefix (else the whole bucket).
+1. **List** objects — key-paginated `ListObjects` (pass the previous page's last key
+   as `startingKey`), across both the staging and final prefixes (§8.1).
+2. **Join + filter** — keep only keys that are **unassociated** (no artifact row
+   references this `ObjectKey`; staging keys are unassociated by construction) **and
+   aged past the grace window** (§8.2.1). This join is the **re-validation**: a key
+   is deleted only if it is *still* orphaned at execution time, closing the
+   flag-then-delete race against an in-flight upload.
+3. **Delete** — bulk `DeleteObjects(bucket, keys)` per page (goutils S3, wrapping
+   minio `RemoveObjects`); **404 / not-found = success**. Per-key hard failures are
+   left for the next run to re-derive and retry.
 
-Workspaces need **no** such reset. The Phase-1 cascade is a **single atomic data
-transition** (§8.3.3), so a crash cannot strand a workspace with some artifacts
-still un-cascaded: the mark-all either committed or did not. If it committed, the
-completion poll (§8.3.3) re-evaluates the `PURGING` workspace every round and
-finishes it; if it did not commit, the workspace is still `PENDING_PURGE` (or is
-re-picked to `PURGING`, re-running the same idempotent cascade). Either way it
-converges without a dedicated reset.
+Two launch triggers, same Task:
+- **Maintenance loop** — periodically, as the routine reclamation sweep.
+- **Operator, on demand** — the "Reap unassociated objects" REST endpoint (§7.1),
+  for prompt reclamation without waiting for the next sweep.
 
-#### 8.3.2 Purging an artifact
-1. User marks the artifact for purging → `PENDING_PURGE` (§7.1 delete artifact).
-2. Maintenance picks up `PENDING_PURGE` artifacts → `PURGING`.
-3. **Delete the backing object** (404-tolerant, per the invariant).
-4. Mark the artifact `PURGED`.
+Because deletion lags purge by up to a sweep interval, this is **eventually
+consistent** reclamation. If a deployment ever needs bounded-latency deletion (e.g.
+sensitive data), the fix is a *best-effort* immediate `reap-objects` launch on
+purge — a latency optimization, not a correctness dependency, so none of the coupled
+machinery returns.
 
-#### 8.3.3 Purging a workspace (multi-phase, reuses artifact purge)
-Assumes the volume is already deleted (`VolumeState = NONE` invariant).
+#### 8.3.2 Maintenance loop (the reconciliation backstop)
+cairn runs its **own** periodic loop (owned by the orchestration system; a restart
+resumes cleanly because every decision is derived from durable DB/store state, never
+in-memory progress). It:
+- runs the **§8.2 reconciliations** — object detection (launching `reap-objects`),
+  `MISSING_OBJECT` flagging, and volume-state drift correction;
+- **reaps terminal `tasking` Tasks** — periodically `ListTasks` for cairn's
+  `reap-objects` Tasks in a terminal state (`COMPLETE` / `CANCELLED`) and
+  `DeleteTask`s them, so its fire-and-forget launches don't accumulate in `tasking`'s
+  DB. (These Tasks are never workflow-linked, so `DeleteTask` is never refused.)
 
-- **Phase 1 — mark & cascade.** User marks the workspace for purging →
-  `PENDING_PURGE`. Maintenance picks it up → `PURGING`, then marks **all its
-  artifacts** `PENDING_PURGE` in a **single data transition** (one set-based
-  update over the workspace's artifacts, not a per-row loop). Because it is one
-  atomic statement, a crash cannot leave the cascade half-applied — it either
-  committed for all artifacts or none, and re-running it (per the idempotent
-  self-transition rule, §8.3) is a no-op on rows already `PENDING_PURGE`. Phase
-  ends. The workspace does **not** delete objects itself — it relies on the
-  artifact-purge task (§8.3.2) to drain them.
-- **Phase 2 — drain.** The artifact-purge task purges those artifacts on its own
-  schedule.
-- **Phase 3 — completion poll.** Maintenance periodically re-examines `PURGING`
-  workspaces. A workspace is **complete** when **no artifact row remains that is
-  not `PURGED`** — i.e. either zero artifact rows remain (rows already removed by
-  §8.3.4) or every remaining row is `PURGED`. (Stated as a negative predicate on
-  purpose: do **not** implement it as "count of `PURGED` == original count," which
-  breaks once rows are cleaned up.) On completion → mark the workspace `PURGED`.
-
-#### 8.3.4 Deleting purged entries from the DB
-Maintenance periodically deletes rows — workspace or artifact — in the `PURGED`
-state.
-
-**FK-safe ordering:** delete `PURGED` **artifact** rows before (or independently
-of) the `PURGED` **workspace** row that parents them, so a workspace row is never
-removed while artifacts still reference its `WorkspaceID`. The §8.3.3 completion
-gate already ensures a workspace only becomes `PURGED` after its artifacts are
-done, so this ordering just protects the row-deletion step itself.
+**Failure policy.** A `SQLError` from cairn's own DB (see `tasking`'s
+`models.SQLError` for the shape) is **not** swallowed: log it and **halt the loop**.
+A halted loop is a loud signal — the orchestration system restarts the process, which
+draws attention — and is far safer than a loop silently spinning against a broken or
+inconsistent database. Transient object-store or `tasking`-reachability failures are
+not fatal: the level-triggered sweep simply retries them next run.
 
 ---
 
 ## 9. Deferred / out of scope (for now)
 
-- **Maintenance scheduling** — how/when the jobs in §8 run is owned by the
-  **`tasking`** workflow & task-execution engine, **not** this service.
+- **Maintenance scheduling** — object reaping runs on the **`tasking`** task engine
+  (§8.3); cairn's own maintenance-loop cadence (reconciliation interval, grace
+  window) is deployment config, set at implementation time.
 - **Error taxonomy** — REST HTTP status codes and the MCP structured-error shape
   for the various refusals (mounted-volume, `VolumeState ≠ NONE`, name collision,
   no-volume precondition, …) are left to **implementation time**.
-- ~~**`goutils` Docker factoring**~~ — **done:** the reusable Docker components
-  shared by `multitool`, `rest-pty`, and this service now live in
-  `goutils/runtime` (§1).
 - **Cross-tenant name-collision** — deployment concern, not solved in-service
   (§2.3).
 - **Multipart / massive uploads** — single-PUT size cap for the first cut (§5.2).
 - **How the agent *requests* a transfer at a higher level** — the ergonomics of
-  chaining tool → save → load across a pipeline (parked earlier).
+  chaining tool → save → load across a pipeline.
 - **`resources/read` exposure of artifacts** — per-tool opt-in, now cleaner with
   an object store + DB behind it; not yet revisited.
 
