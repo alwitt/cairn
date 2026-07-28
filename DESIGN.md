@@ -85,8 +85,12 @@ whenever the volume is reaped.
 | **`rest-pty`** (future) | Runs shell-session containers; **mounts** workspace volumes. Same mount-only posture. |
 
 > Three services now need Docker integration (`multitool`, `rest-pty`, `cairn`).
-> Reusable Docker components should later be factored into `goutils` —
-> **deferred to a separate effort.**
+> The reusable Docker components have been factored into **`goutils/runtime`**:
+> `docker.go` provides the sandboxed container runtime, and `docker_volume.go`
+> provides a `VolumeManager` (create / delete / list / inspect a volume, plus
+> the mounter lookup that backs the in-use check). `cairn` builds its volume
+> lifecycle and transfer sidecars on these rather than re-implementing Docker
+> integration.
 
 ---
 
@@ -109,9 +113,10 @@ whenever the volume is reaped.
 **`VolumeName` is ID-derived and persisted (a convenience cache).** It is computed
 once as `<app-name>-<workspace ID>` at workspace-create and stored, so **no client
 ever guesses or re-derives it** — `multitool`/`rest-pty` fetch the workspace and
-read `VolumeName` directly (the service owns and returns the name). The
-application/project name is chosen when the repo is created, and namespaces the
-service's volumes for `VolumeList` filtering.
+read `VolumeName` directly (the service owns and returns the name). `app-name` is a
+**per-deployment config value** (charset `[a-zA-Z0-9-_]`, same class as the
+service-level object-key prefix below) that namespaces this deployment's volumes
+for `VolumeList` filtering.
 
 - **Why `ID`, not `Name`:** the ID is **immutable**, so the volume name is stable
   across a workspace rename. This means rename **never touches the volume** — the
@@ -172,8 +177,8 @@ guards, and §8.2.2 for reconciliation when Docker drifts from the column.
 | `Name` | string, unique per workspace | Display name; how the agent refers to it. **No relationship to the object key.** |
 | `Description` | string, optional | Free-text. |
 | `ObjectKey` | string | The **complete** object key in the store. |
-| `MIMEType` | string | **Server-sniffed** content type (§6). Stored on the row so `list`/`fetch` report it without a `HeadObject`. Also set as the object's `Content-Type`. |
-| `Size` | int64 | Size in bytes (obtained during the sniff/ranged-GET). |
+| `MIMEType` | string | **Server-sniffed** content type (§6), stored on the row so `list`/`fetch` report it without a `HeadObject`. **Advisory metadata only** — a label/download-name hint, **not a security boundary** (serving forces `attachment`, §6/§6.5). Also set as the object's `Content-Type`. |
+| `Size` | int64 | Size in bytes (from `GetObjectStat` on the staging object, §6.1). |
 | `State` | string enum | Artifact lifecycle. See §2.2.1. |
 | `CreatedAt` | timestamp | — |
 | `UpdatedAt` | timestamp | — |
@@ -194,7 +199,7 @@ RECORDED ─────────────▶ PENDING_PURGE ─▶ PURGING
 | State | Meaning |
 |---|---|
 | `RECORDED` | Registered and stored — the sole **live** state. |
-| `MISSING_OBJECT` | Data-consistency flag: the row's backing object is **gone** (§8.2.1 item 3). A **quarantine** state — not auto-remediated, preserves the metadata as evidence of the loss. Can still be moved to `PENDING_PURGE` so an operator can purge it. |
+| `MISSING_OBJECT` | Data-consistency flag: the row's backing object is **gone** (§8.2.1 item 3). A **quarantine** state — not auto-remediated, preserves the metadata as evidence of the loss. Discoverable via the `list_artifacts` state-filter option (§7.1), and can still be moved to `PENDING_PURGE` so an operator can purge it. |
 | `PENDING_PURGE` | Marked for purging; **queued** for lifecycle management. |
 | `PURGING` | Lifecycle management is **actively** deleting it. |
 | `PURGED` | Purge complete (terminal); row removed on the next cleanup round. |
@@ -217,8 +222,7 @@ systems (e.g. an org→group→user hierarchy would not fit a flat `owner`). Ins
   (artifacts). Uniqueness is **unqualified**.
 - **Cross-tenant name collision is explicitly NOT solved here.** A shared instance
   assumes a single tenant, or a caller that pre-namespaces names. This is a
-  **documented deployment constraint**, not logic in the service (cf. concurrency
-  deferred to an upstream proxy).
+  **documented deployment constraint**, not logic in the service.
 
 ### 2.4 No authn / authz
 The service performs **no authentication or authorization** of its callers. Like
@@ -269,9 +273,11 @@ created and deleted **explicitly by the operator**.
   call returns only when Docker has created the volume (or failed). On success the
   DB flips `NONE → READY`; on failure the column stays `NONE`. Idempotent.
 - Volume **deleted** only on operator request — **synchronous & blocking**: the
-  service verifies no container mounts it (§4.3), removes it, and returns only when
+  service does **not** pre-check for mounts; it issues `VolumeRemove(force=false)`
+  and lets the **Docker daemon** decide atomically (§4.3) — the daemon removes the
+  volume or refuses with a "volume is in use" error. The call returns only when
   Docker has removed it (or failed/refused). On success the DB flips `READY →
-  NONE`; on failure the column stays `READY`.
+  NONE`; on failure/refusal the column stays `READY`.
 
 Because both ops write the column **only after** Docker succeeds, `VolumeState`
 has no transient states (§2.1.2). Drift can still arise from *outside* the service
@@ -298,6 +304,30 @@ containers mounting volume  →  volume  →  workspace record
 - Operator tears down **bottom-up**: stop workloads → delete volume
   (`VolumeState → NONE`) → mark workspace for deletion (`State → PENDING_PURGE`).
 
+### 4.4 Canonical mount path (`/mnt/cairn/ws`)
+Artifact paths only round-trip if **every** container that mounts a workspace
+volume mounts it at the **same** path — the tool container where the agent's tool
+writes/reads a file, **and** cairn's own stat/hash and transfer sidecars. A file
+the agent's tool wrote at `/mnt/cairn/ws/out.txt` must be visible to the upload
+sidecar at that exact path, or no artifact operation works.
+
+- **The mount path is a fixed constant: `/mnt/cairn/ws`.** It is **not** a data-model
+  field and **not** per-workspace — it is one service-wide value used by clients and
+  sidecars alike. (Kept a named constant, not scattered literals, so it *can* become
+  configurable later; fixed for the first cut.)
+- **One workspace per containerized tool call.** Because the mount path is a single
+  fixed location, at most one workspace volume can be mounted into a given container.
+  This is an accepted, explicit constraint — multi-workspace mounting would require a
+  per-workspace (or per-mount) path and is deferred.
+- **Client contract.** `multitool` (and later `rest-pty`) mount the workspace volume
+  at `/mnt/cairn/ws`. Workspace-enabled MCP tools advertise it, e.g.: *"if you elect
+  to execute the tool in a shared workspace, provide the workspace name; the workspace
+  volume is mounted at `/mnt/cairn/ws`."*
+- **Path contract.** Every agent-supplied artifact path is **absolute and under
+  `/mnt/cairn/ws`**. cairn validates it (§7.5) and uses it **verbatim** in the
+  sidecar — no prefix translation, because the sidecar mounts at the same path. The
+  earlier `/mnt/cairn/ws/<path>` shorthand is replaced by `/mnt/cairn/ws/<path>` throughout.
+
 ---
 
 ## 5. Transfer sidecars & security posture
@@ -310,8 +340,19 @@ container).
 | Container | Network | Credentials | Runs agent-influenced code |
 |---|---|---|---|
 | **Tool container** (in `multitool`) | none | none | yes |
-| **Transfer sidecar** | **object-store only** (scoped egress) | **none** (uses presigned URLs) | no — fixed `curl` over server-provided URLs |
+| **Stat/hash sidecar** (volume-based upload/update only) | **none** | **none** | no — fixed command; resolves + validates a volume source file, emits a `{resolved_path, valid, size, sha256}` stat block on stdout (§6.4, §7.5.3) |
+| **Transfer sidecar** | reaches the **object store** (via its presigned URL); does **not** call back into the service | **none** (uses presigned URLs) | no — fixed `curl` over server-provided URLs |
 | **Service process** | yes | **yes** (sole credential holder) | no |
+
+The **stat/hash sidecar** exists only on the MCP upload/update path: a presigned
+PUT URL is bound to an exact `Content-Length` + SHA-256 (§6.4), and the bytes live
+in the volume, reachable only from a sidecar — so their size and hash must be
+computed in a sidecar *before* the PUT URL can be minted. It needs **no network at
+all** (it neither reaches the object store nor calls back into the service — it
+only writes stdout, which the service reads via `ContainerWait`, §7.3). Like the
+transfer sidecar it runs a **fixed command over a server-supplied path**, not
+agent-supplied code, which is what keeps it in the "no agent-influenced code"
+tier.
 
 ### 5.2 Presigned URLs eliminate in-sandbox credentials
 The service holds object-store credentials and mints **short-lived, key- and
@@ -327,33 +368,59 @@ Disciplines:
 - **Single-PUT size cap** for the first cut (multipart deferred). "Too big" is an
   error, not something to engineer around.
 
-> Note: sidecars do **NOT** call back into the service's REST API (see §7.3). So
-> sidecar egress is object-store-only; it does not need to reach the service.
+> Note: sidecars do **NOT** call back into the service's REST API (see §7.3) — a
+> transfer sidecar's only outbound traffic is to the object store (its presigned
+> URL), and the stat/hash sidecar makes no network calls at all. Network-level
+> *enforcement* of this (locking a sidecar down to object-store-only egress) is
+> **not implemented in the first pass** — it is an OPS/deployment concern, not an
+> in-service guarantee.
 
 ---
 
 ## 6. Upload path: staging + server-side MIME sniff
 
-Because the system is **human- and browser-facing**, an artifact's stored
-`Content-Type` must be **trustworthy** — it drives browser rendering and is a
-security boundary (a spoofed `text/html` artifact viewed directly = stored XSS).
-The upload source is **not trusted** to declare MIME. Therefore the server derives
-MIME from the bytes.
+The upload source is **not trusted** to declare MIME, so the server sniffs it from
+the bytes (§6.1). The sniffed `MIMEType` is **descriptive metadata** — a label for
+listings, a download-filename hint, and programmatic consumers — **not a security
+boundary.**
+
+**Serving discipline (the XSS control).** Rather than rely on the stored
+`Content-Type` to be safe, the **serving path never renders an artifact inline**:
+every presigned **GET** URL is minted with `response-content-disposition=attachment`
+(see §6.5), so a browser opening an artifact URL **downloads** it instead of
+parsing/executing it. This neutralizes the stored-XSS vector (a `text/html`
+artifact downloads rather than running a script) **independent of** what
+`Content-Type` the object carries — which is why the MIME value can be demoted to
+advisory metadata. **Inline preview is deliberately dropped** in exchange for this
+guarantee.
 
 ### 6.1 Two REST calls (no DB write until bytes exist)
-1. **Request staging upload URL** (workspace by ID) — server presigns a PUT to a
-   **server-generated, workspace-scoped staging key**, returns
-   `{ url, staging_key, hmac }`. **No DB operation.**
+1. **Request staging upload URL** (workspace by ID) — caller supplies the object's
+   exact **size** and base64 **SHA-256** (goutils `GeneratePresignedPutURL` binds
+   both into the signed URL: `Content-Length` + `x-amz-checksum-sha256`, so the
+   object store **verifies** the uploaded bytes and rejects a size/hash mismatch).
+   Server presigns a PUT to a **server-generated, workspace-scoped staging key**
+   and returns `{ url, staging_key }`. **No DB operation.** The **single-PUT size
+   cap** (§5.2) can be enforced here, at mint time, from the supplied size — a
+   fail-fast in addition to the authoritative re-check at register (step 2.2).
 2. **Register artifact from staging** (workspace by ID) — caller sends
-   `staging_key` + `hmac` (+ name, description). Server:
-   1. Verifies the HMAC (proves the staging key was server-issued for *this*
-      workspace — the HMAC covers `(staging_key, workspace_id)`).
-   2. **Ranged-GET** the staging object prefix, **sniff MIME** (magic-number lib).
-   3. Generate final key `<prefix>/<ws-id>/<random>`.
-   4. **`CopyObject`** staging → final with the sniffed `Content-Type`.
-   5. **Insert** the artifact DB row (uniqueness enforced by the DB constraint on
+   `staging_key` (+ name, description). Server:
+   1. **Verify the staging key belongs to this workspace** — the key must carry the
+      `<staging-prefix>/<ws-id>` prefix for the target workspace. This replaces the
+      former HMAC check: because the staging key is server-generated and
+      workspace-scoped by construction (§8.1), a simple prefix match proves the key
+      was issued for *this* workspace and rejects a key aimed at another.
+   2. **Enforce the single-PUT size cap** — `GetObjectStat` the staging object
+      (goutils `S3Client.GetObjectStat` → `S3ObjectStat.Size`) and reject an
+      over-cap object here, before any copy (§5.2). "Too big" is an error at this
+      step; no `CopyObject` and no row is created.
+   3. **Ranged-GET** the staging object's leading bytes, **sniff MIME**
+      (magic-number lib).
+   4. Generate final key `<prefix>/<ws-id>/<random>`.
+   5. **`CopyObject`** staging → final with the sniffed `Content-Type`.
+   6. **Insert** the artifact DB row (uniqueness enforced by the DB constraint on
       `(WorkspaceID, Name)`; a handler pre-check is only a fail-fast optimization).
-   6. **Delete** the staging object (best-effort).
+   7. **Delete** the staging object (best-effort).
 
 **Ordering rule:** copy → insert (constraint-guarded) → best-effort staging
 delete. Never insert before copy (would yield a row pointing at nothing).
@@ -371,13 +438,100 @@ data-consistency job for aged staging objects (§8.2.1 item 1).
   self-copy versioning caveat.
 
 ### 6.3 Update = register minus the insert
-Update reuses the staging flow but does **not** create a new DB row:
-- New staging upload → sniff → **`CopyObject` to a NEW final key** → **update the
+Update reuses the staging flow (including the **same pre-copy checks** as §6.1
+step 2 — staging-key ownership verify, then the single-PUT size cap via
+`GetObjectStat`) but does **not** create a new DB row:
+- New staging upload → **verify staging-key prefix** → **enforce size cap**
+  (`GetObjectStat`) → sniff → **`CopyObject` to a NEW final key** → **update the
   row's `object_key`/MIME/size** to the new key → delete staging.
 - The flip from old key to new key is a single row update → **atomic** (readers
   always see a complete object).
 - The **old object is orphaned by design** → reaped by the maintenance system
   (§8.2.1 item 2).
+
+### 6.4 Volume-based upload/update: two sidecars in front of the same staging flow
+This path serves **any upload whose bytes are volume-resident** — the MCP
+`upload_artifact` / `update_artifact` tools **and** the REST "Save artifact" /
+"Update artifact" endpoints (§7.1, §7.4). The staging-based REST path (§6.1)
+assumes the caller already holds the bytes outside a volume and can compute their
+size + SHA-256 locally before requesting the staging URL. A volume-based caller
+**cannot** — the bytes live in the workspace **volume**, reachable only from a
+sidecar, and the presigned staging PUT URL must be bound to the exact size + hash
+*before* it can be minted (§6.1 step 1). So the volume-based path prepends a
+**stat/hash sidecar** and otherwise reuses the existing staging + register/update
+core path unchanged:
+
+1. **Stat/hash sidecar** — mounts the volume, runs a fixed command over the
+   agent-supplied source path `/mnt/cairn/ws/<path>`, and emits a JSON stat block on stdout
+   (schema and source-file rules in §7.5.3):
+   ```json
+   { "resolved_path": "<absolute path, symlink-resolved | null>",
+     "valid":         true,
+     "size":          <uint64>,
+     "sha256":        "<sha256sum output>" }
+   ```
+   Symlinks are **accepted**, but the sidecar stats and hashes the **resolved
+   target file**, not the link (`resolved_path` is the symlink-resolved absolute
+   path; `null`/absent when the path does not exist). No MIME sniff here — MIME is
+   still sniffed **server-side** at register (§6.1 step 2.3), so it stays
+   trustworthy rather than sidecar-asserted. No network, no credentials (§5.1). The
+   service reads stdout via `ContainerWait` and **rejects the upload if `valid` is
+   false** (missing path, directory, non-regular file) before minting anything.
+2. **Size cap (fail fast)** — reject on the reported size before minting anything
+   (§5.2).
+3. **Mint the staging PUT URL** — bound to that exact size + SHA-256 (§6.1 step 1).
+4. **Upload sidecar** — `curl -T /mnt/cairn/ws/<path>` to the staging URL. The object store
+   **verifies the checksum** and rejects a mismatch.
+5. **Register / update from staging** — the **existing** core path (§6.1 step 2 /
+   §6.3): staging-key verify → size cap re-check → **server-side MIME sniff** →
+   `CopyObject` staging→final → insert/update row → delete staging.
+
+**TOCTOU fails closed (by design).** The staging PUT is bound to the hash the
+stat/hash sidecar computed. If the file **changes on the shared volume** (§0)
+between the stat sidecar and the upload sidecar, the uploaded bytes no longer
+match the signed checksum and the **object store rejects the PUT**. This is the
+intended behavior: a mid-flight content change is an **operational failure**
+(content is not expected to change under an in-flight upload), surfaced to the
+agent as a legible "file changed during upload" error (§7.5), never silent
+corruption. Same-length changes are caught too, because the bind is on the hash,
+not just `Content-Length`.
+
+**Cost accepted:** the volume file is read **twice** — once by the stat/hash
+sidecar (to hash) and once by the upload sidecar (to transfer). `curl` does not
+re-hash; it sends the checksum the service supplies, and the object store does the
+one authoritative verification. The double read is the price of the presigned-PUT
+integrity contract when the bytes are volume-resident; acceptable for a
+size-capped artifact service.
+
+### 6.5 Serving artifacts safely (`response-content-disposition=attachment`)
+Every presigned **GET** URL cairn mints (REST fetch-with-`?presign`, MCP
+`download_artifact` reads the object into the volume, and any UI download) sets the
+S3 **`response-content-disposition=attachment`** response override at **mint
+time**. Minting-time is essential: the override is a signed query parameter cairn
+controls, so neither the uploader nor the sidecar can undermine it — unlike an
+object-stored `Content-Disposition`, which the checksum-bound-but-not-disposition-
+bound PUT (§6.1) cannot guarantee.
+
+- **The override is a browser-XSS safeguard only.** It matters solely for
+  **browser-facing** GETs (the REST `?presign` URL, a UI download) — a browser
+  honors `Content-Disposition: attachment` and downloads instead of rendering. The
+  MCP `download_artifact` sidecar runs `curl -o /mnt/cairn/ws/<path>`, which **ignores**
+  `Content-Disposition` entirely (it writes to the `-o` target regardless), so the
+  override is **inert but harmless** on that path. cairn still mints every GET with
+  `attachment` uniformly rather than branching on the consumer — there is no path
+  where it hurts, and it removes the risk of accidentally minting a
+  non-`attachment` browser URL.
+- Requires a small **goutils** addition: `GeneratePresignedGetURL` currently passes
+  `nil` request parameters; it must accept `response-content-disposition`
+  (and optionally other `response-*` overrides) to thread through to the presigned
+  URL.
+- **`X-Content-Type-Options: nosniff`** is a *response header the object store
+  emits*, **not** a signable query parameter, so cairn's S3 client **cannot**
+  guarantee it from the presigned URL alone. It is left as an **operational /
+  serving-edge configuration** (object-store config, or a proxy/CDN in front of the
+  store) — a documented deployment note, not an in-service guarantee. `attachment`
+  already makes content-sniffing moot for the execution path, so `nosniff` is
+  defense-in-depth on top, not the primary control.
 
 ---
 
@@ -388,54 +542,83 @@ Update reuses the staging flow but does **not** create a new DB row:
 |---|---|
 | Create workspace | DB row only, no volume. |
 | List workspaces | — |
-| Fetch workspace | Record + derived state (volume exists? mounted?). |
+| Fetch workspace | Record + `VolumeState` (volume ready?) + the **estimated number of containers currently mounting** the workspace volume (from Docker's `RefCount` via `system/df`, §4.3; `-1` when unavailable). |
 | Rename workspace (`Name`) | Pure DB; **no volume guard**. The volume name is derived from the immutable `ID` (§2.1), so rename never affects the volume — safe even with a live, mounted volume. Object key is also ID-based, untouched. |
 | Update workspace `Description` | Pure DB; no guards. |
-| Mark workspace for deletion | Refuse unless `VolumeState = NONE`; cascade artifacts → `PENDING_PURGE`. |
+| Mark workspace for deletion | Refuse unless `VolumeState = NONE`; flips the workspace to `PENDING_PURGE` only. The maintenance system picks it up from there and drives the cascade (§8.3.3). |
 | Create volume | Provision named volume (idempotent). |
 | Delete volume | **Refuse if mounted** (Docker-side check). |
-| **Generate staging PUT URL** | Pure object-store; returns `{url, staging_key, hmac}`; no DB. |
-| **Register artifact from staging** | §6.1 step 2. |
-| List artifacts | Metadata only; excludes non-`RECORDED`. |
-| Fetch artifact (opt. `?presign` GET URL) | Non-`RECORDED` artifacts not served. |
-| Delete artifact | **Marks** for deletion (`PENDING_PURGE`); mechanism → maintenance system (§8.3.2); idempotent. |
-| Update artifact from staging | §6.3 (replaces the bytes/`ObjectKey`). |
+| **Generate staging PUT URL** | Caller supplies exact size + base64 SHA-256 (bound into the URL, §6.1 step 1); size cap may fail fast here. Pure object-store; returns `{url, staging_key}`; no DB. |
+| **Register artifact from staging** | §6.1 step 2. **Parent workspace must be `ACTIVE`** (§7.5) — refuse otherwise. |
+| List artifacts | Metadata only. A **state filter is a listing option**: by default only `RECORDED` is returned, but the caller may request other states (e.g. `MISSING_OBJECT` for triage, §8.2.1 item 3). The option — not a hardcoded filter — decides what is returned. |
+| Fetch artifact (opt. `?presign` GET URL) | Serves any artifact by ID; a `?presign` GET URL is only minted for a `RECORDED` artifact (a non-`RECORDED` artifact has no servable object), and is minted with `response-content-disposition=attachment` (§6.5). |
+| Delete artifact | **Marks** for deletion (`PENDING_PURGE`); valid from `RECORDED` **or** `MISSING_OBJECT` (§2.2.1); mechanism → maintenance system (§8.3.2); idempotent. |
+| Update artifact from staging | §6.3 (replaces the bytes/`ObjectKey`). **Parent workspace must be `ACTIVE`** (§7.5) — refuse otherwise. |
 | Rename artifact (`Name`) | Pure DB; the object key is random-suffixed so it is untouched (§2.2). Uniqueness enforced by `(WorkspaceID, Name)`. |
 | Update artifact `Description` | Pure DB; no guards. |
-| **Load artifact → volume** | Shared data path with MCP (§7.4). |
-| **Save artifact ← volume** | Shared data path with MCP (§7.4). |
+| **Load artifact → volume** | Object → volume (download). Shared data path with MCP `download_artifact` (§7.4). |
+| **Save artifact** (volume → object) | Creates a **new** artifact from a volume file. Fails if the name is already taken (uniqueness on `(WorkspaceID, Name)`). REST peer of MCP `upload_artifact` (§7.4). Parent workspace must be `ACTIVE` (§7.5). |
+| **Update artifact** (volume → object) | Replaces an **existing** artifact's bytes from a volume file (§6.3). Fails if the artifact does not exist. REST peer of MCP `update_artifact` (§7.4). Parent workspace must be `ACTIVE` (§7.5). |
 
 ### 7.2 MCP API (agent; name-addressed)
 Resolve names→IDs at the handler, then everything downstream is ID/key-addressed.
+Every volume-touching tool (`upload_artifact`, `update_artifact`,
+`download_artifact`) takes a file path that is **absolute and under the canonical
+mount `/mnt/cairn/ws`** (§4.4); the volume is mounted there in both the tool
+container and cairn's sidecars, so the path the agent names is the path the sidecar
+uses.
 
 | Tool | Behavior |
 |---|---|
-| `list_artifacts` | List artifacts in a workspace. |
-| `download_artifact` | Object → volume. Presign **GET**; sidecar mounts volume, `curl -o /vol/<path>`. Read direction, no core-register step. |
-| `upload_artifact` | Volume → object, **new** artifact. See §7.3. |
-| `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same as upload but calls the **update** core function. |
-| `delete_artifact` | Marks an artifact for deletion. |
+| `list_artifacts` | List artifacts in a workspace. Same state-filter listing option as REST (§7.1): defaults to `RECORDED`, other states requestable. |
+| `download_artifact` | Object → volume. Presign **GET** (`attachment`, §6.5); sidecar mounts volume at `/mnt/cairn/ws` (§4.4), `curl -o /mnt/cairn/ws/<path>`. Read direction, single sidecar, no core-register step. **The destination directory must already exist** — the agent prepares it first (§7.5.1). |
+| `upload_artifact` | Volume → object, **new** artifact. **Two sidecars** (stat/hash then upload) in front of the staging + register core path, §6.4 / §7.3. Parent workspace must be `ACTIVE` (§7.5). |
+| `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same two-sidecar flow as upload (§6.4) but calls the **update** core function. Parent workspace must be `ACTIVE` (§7.5). |
+| `delete_artifact` | Marks an artifact for deletion (`PENDING_PURGE`); valid from `RECORDED` or `MISSING_OBJECT` (§2.2.1). |
 | `rename_artifact` | Updates an artifact's name (pure DB update). |
 | `list_workspaces` | Read-only. Lists workspaces the agent can use. |
-| `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether a volume is mounted-ready). |
+| `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether the volume is ready to mount) plus the **estimated number of containers currently mounting** the workspace volume (Docker `RefCount`, §4.3). |
 
 ### 7.3 Synchronous MCP model — call the core function directly (no self-REST hop)
 An MCP tool call is **synchronous and server-orchestrated**: the service launches
-the sidecar, waits for it, and knows exactly when the upload finished. The REST
+the sidecar(s), waits for each (`ContainerWait`), and knows exactly when the work
+finished (upload = two sidecars in sequence, §6.4; download = one). The REST
 staging→upload→**notify** callback exists only because REST clients are
 asynchronous/external; that asymmetry does not apply to MCP. So the MCP tool does
-**not** curl back into its own REST endpoint.
+**not** curl back into its own REST endpoint — the sidecars only touch the volume
+and the object store, never the service (§5.1).
 
 `upload_artifact` flow:
-1. Resolve workspace name → ID; **pre-check** `(workspace, name)` availability.
-2. **Presign** staging PUT URL (in-process).
-3. **Sidecar**: mount volume, `curl -T /vol/<path> <staging-url>`, exit. Service
-   waits (`ContainerWait`).
-4. On success → **call `RegisterArtifactFromStaging(...)` directly** (in-process):
-   sniff → `CopyObject` → insert (constraint-guarded) → delete staging.
-5. Return the tool result from the core function's outcome.
+1. Resolve workspace name → ID; **pre-check that the name is *free*** in
+   `(workspace, name)` (upload creates a new artifact). This is a pre-sidecar
+   fail-fast; the DB uniqueness constraint remains the real guard (§7.5).
+2. **Stat/hash sidecar**: mount volume, emit the `{resolved_path, valid, size,
+   sha256}` stat block for `/mnt/cairn/ws/<path>` on stdout, exit. Service waits
+   (`ContainerWait`), reads the JSON, **rejects if `valid` is false** (§7.5.3),
+   then applies the size cap (fail fast) (§6.4).
+3. **Presign** staging PUT URL (in-process), bound to that size + SHA-256.
+4. **Upload sidecar**: mount volume, `curl -T /mnt/cairn/ws/<path> <staging-url>`, exit.
+   Service waits (`ContainerWait`). The object store verifies the checksum; a
+   mismatch (changed file) fails the upload (§6.4 — TOCTOU fails closed).
+5. On success → **call `RegisterArtifactFromStaging(...)` directly** (in-process):
+   verify staging-key prefix → size cap (`GetObjectStat`) → sniff → `CopyObject` →
+   insert (constraint-guarded) → delete staging.
+6. Return the tool result from the core function's outcome.
 
-`update_artifact` is identical but calls `UpdateArtifactFromStaging(...)`.
+`update_artifact` runs the same two-sidecar flow but with the **inverse** name
+pre-check and a different core function:
+- **Step 1 pre-check is existence, not availability** — update replaces an
+  existing artifact, so it pre-checks (pre-sidecar, fail-fast) that an artifact by
+  that name **exists** in the workspace *and* the parent workspace is `ACTIVE`
+  (§7.5), rather than checking the name is free. Spending two sidecars only to have
+  the core function reject an unknown/inactive target is wasteful; this fails
+  before either sidecar runs.
+- **Step 5 calls `UpdateArtifactFromStaging(...)`** — same staging-key verify and
+  size cap, then updates the row instead of inserting (§6.3).
+
+Either path's stat/hash sidecar (step 2) is also a **backup validity gate**: its
+`valid` bool (§7.5.3) catches a source path that became missing/invalid between the
+pre-check and the sidecar run.
 
 **Reuse pattern — one core function, two front-doors:**
 ```
@@ -444,35 +627,83 @@ RegisterArtifactFromStaging(ctx, workspace, name, staging_key, …) → (artifac
    └── MCP upload   → calls core directly after the upload container exits
 ```
 Same DRY benefit as the abandoned callback design, but shared at the
-**function-call layer** — no auth/network/async cost, and sidecar egress stays
-object-store-only.
+**function-call layer** — no auth/network/async cost, and sidecars never need to
+reach the service (their only outbound traffic is a transfer sidecar's object-store
+upload/download).
 
-### 7.4 Shared data path (REST ⇄ MCP volume transfers)
-The REST "load into volume" / "save from volume" endpoints and the MCP
-`download_artifact` / `upload_artifact` tools are **thin front-doors onto one
-shared transfer engine**. They differ only in **addressing** (REST: IDs; MCP:
-names→IDs) and **caller** (operator vs. agent). Designed once, so REST and MCP
-cannot drift.
+### 7.4 Shared core, path-specific front-ends (REST ⇄ MCP)
+REST and MCP share the **register/update core** (§7.3) and the **presigned-URL +
+sidecar transfer mechanics**, so the security-critical logic is written once and
+cannot drift. They are **not** a single uniform "one transfer engine," though —
+the front-ends differ by more than addressing:
+
+- **Addressing / caller** — REST: IDs, operator; MCP: names→IDs, agent.
+- **Two upload families, by where the bytes live** —
+  - *Staging-based (REST only)*: "Generate staging PUT URL" + "Register/Update
+    artifact from staging" (§6.1). The caller already holds the bytes **outside a
+    volume** and computes size + SHA-256 locally, so **no stat/hash sidecar**.
+  - *Volume-based (MCP `upload_artifact`/`update_artifact` **and** REST "Save
+    artifact"/"Update artifact")*: the bytes are **volume-resident**, so size +
+    SHA-256 must be derived by the **stat/hash sidecar** before the PUT URL is
+    minted (§6.4). Both surfaces run the same two-sidecar flow; they differ only in
+    addressing/caller. The stat/hash sidecar is a property of the **volume-based**
+    path, not of MCP specifically.
+- **Download symmetry holds** — MCP `download_artifact` and the REST "Load artifact
+  → volume" endpoint are both a single presigned-**GET** sidecar (`attachment`,
+  §6.5); no stat step is needed for reads (a GET binds no size/hash up front).
 
 ### 7.5 Handler-level validation & preconditions (all volume-touching ops)
-- **Volume path validation** — agent-supplied `/vol/<path>` must be under the
-  mount, no `..` traversal. Enforced in the handler.
+- **Parent workspace must be `ACTIVE`** — every artifact create/update
+  (`RegisterArtifactFromStaging`, `UpdateArtifactFromStaging`, and the
+  `upload_artifact` / `update_artifact` MCP tools that call them) refuses unless
+  the parent workspace `State = ACTIVE`. This stops new/replacement bytes from
+  landing in a workspace already `PENDING_PURGE` / `PURGING`, which would race the
+  purge cascade (§8.3.3) and strand fresh objects. Read paths
+  (`download_artifact`, list/fetch) are not gated on this.
+- **Single-PUT size cap** — enforced by both core functions via a `GetObjectStat`
+  on the staging object: `RegisterArtifactFromStaging` (§6.1 step 2.2) and
+  `UpdateArtifactFromStaging` (§6.3), and therefore by both the `upload_artifact`
+  and `update_artifact` MCP tools, which route through them. An over-cap staging
+  object is rejected before `CopyObject`; no row is created/updated (§5.2).
+- **Volume path validation** — the agent-supplied path must be **absolute and under
+  the canonical mount `/mnt/cairn/ws`** (§4.4), with no `..` traversal that escapes
+  it. For uploads (where the stat/hash sidecar **resolves symlinks**, §7.5.3), the
+  check is applied to the **resolved target**: a symlink whose target lands outside
+  `/mnt/cairn/ws` is **rejected**, so it cannot exfiltrate the sidecar image's own
+  files. Enforced in the handler.
 - **Volume precondition** — the workspace's volume must **exist and be mountable**;
   otherwise a legible "workspace has no runtime volume" error (the agent cannot
   provision it — operator's REST job), not a raw Docker mount failure.
-- **Name uniqueness** — pre-check pre-sidecar (fail fast); DB constraint is the
-  real guard (handles the TOCTOU race).
+- **Name pre-check (direction depends on the verb)** — create/upload pre-checks
+  the name is **free**; update pre-checks the named artifact **exists** (§7.3).
+  Both are pre-sidecar fail-fasts; the DB uniqueness constraint (create) and the
+  row lookup in the update core (update) are the real guards and handle the TOCTOU
+  race.
+- **Source-file validity (volume-based uploads)** — the stat/hash sidecar reports
+  a `valid` bool over the agent-supplied source path (§7.5.3); the service rejects
+  an invalid source (missing / directory / non-regular file) before minting a PUT
+  URL. Symlinks are accepted and resolved to their target file **only if the
+  resolved target stays under `/mnt/cairn/ws`** (§4.4).
 - **Failure surfacing** — the service orchestrates each step and reads each
   outcome directly (sidecar exit code, then sniff/copy/insert results), composing
   a coherent tool result.
 
 #### 7.5.1 Download write-path semantics (`download_artifact` → volume)
-The download sidecar runs `curl -o /vol/<path>` after `..`-traversal validation.
-Behavior when `/vol/<path>` already exists:
+The download sidecar runs `curl -o /mnt/cairn/ws/<path>` after path validation
+(§7.5). It does **not** create intermediate directories — **the agent must prepare
+the destination directory before calling `download_artifact`.** cairn cannot safely
+`mkdir -p` the parents: it does not control the UID/GID the tool containers run as
+(§4.2 — multiple external mounters), so any directory the sidecar created would be
+owned by the sidecar's UID and unwritable/undeletable by the real tool containers —
+a downstream permission landmine. Directory layout is the agent's job, done from its
+own correctly-UID'd tool container.
 
-| Existing path | Behavior |
+Behavior for the target `/mnt/cairn/ws/<path>`:
+
+| Target path | Behavior |
 |---|---|
-| nothing | Create the file. |
+| **parent dir missing** | **Failure** — `curl -o` does not `mkdir -p`. Legible "destination directory does not exist" error; the agent must create it first. |
+| parent exists, nothing at path | Create the file. |
 | regular file | **Overwrite.** |
 | **symlink** | **Link is replaced by a regular file**, *not* followed — `curl -o` `unlink()`s the link and creates a fresh file, so a planted symlink **cannot** be used to write outside the volume. Safe to allow. |
 | **directory** | **Failure** — `curl -o` cannot target a directory. |
@@ -488,14 +719,43 @@ Concurrent `update_artifact` (or update/register racing on the same name) is
 new object is immediately unreferenced and is reaped as an aged final-object with
 no row (§8.2.1 item 2). No optimistic locking / version column.
 
+#### 7.5.3 Upload read-path semantics (source file)
+The read-side counterpart to §7.5.1. Applies to **every volume-based upload/update**
+— the MCP `upload_artifact`/`update_artifact` tools and the REST `Save artifact` /
+`Update artifact` endpoints (§6.4). The **stat/hash sidecar** classifies the
+agent-supplied source path `/mnt/cairn/ws/<path>` (after `..`-traversal validation, §7.5)
+and emits a stat block; the service acts on it before minting any PUT URL.
+
+| Source path `/mnt/cairn/ws/<path>` | Behavior |
+|---|---|
+| **does not exist** | **Reject** — `valid = false`, `resolved_path = null`. Legible "source file not found" error; nothing minted. |
+| **directory** | **Reject** — `valid = false`. A directory is not a single uploadable object. |
+| **regular file** | **Accept** — stat + SHA-256 the file. |
+| **symlink** | **Accept only if the resolved target stays under `/mnt/cairn/ws`** (§4.4). The link is **resolved**; the sidecar stats and hashes the **target file**, not the link, and `resolved_path` is the resolved absolute path. A symlink whose target escapes the mount is **rejected** (`valid = false`) — it cannot exfiltrate the sidecar image's files. A symlink to a missing/non-regular target reduces to the reject rows above. |
+
+Emitted stat block (stdout JSON, read via `ContainerWait`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `resolved_path` | string \| null | Absolute, symlink-resolved path of the source file. `null`/absent when the path does not exist. |
+| `valid` | bool | Whether the source is a valid single-file upload (a regular file, directly or via a symlink whose resolved target stays under `/mnt/cairn/ws`). The service **rejects** the upload when `false`. |
+| `size` | uint64 | Byte size of the resolved file; binds the presigned PUT `Content-Length` (§6.4). |
+| `sha256` | string | `sha256sum` of the resolved file; binds the presigned PUT checksum (§6.4). |
+
+`valid` is the sidecar's advisory gate (a fast reject for the common cases); it is
+**not** the integrity boundary — the checksum-bound PUT (§6.4) is. The size/hash
+feed the PUT URL, so a source that changes after this stat still fails closed at
+upload time (§6.4 TOCTOU).
+
 ---
 
 ## 8. Maintenance
 
 Maintenance is defined here as **what needs to be done**, not **how it is
-scheduled**. The service does **not** implement a scheduler/loop: a separate
-**workflow & task-execution engine** (another in-flight project) drives these jobs.
-This document only enumerates the maintainable aspects and their remedies.
+scheduled**. The service does **not** implement a scheduler/loop: the separate
+**`tasking`** workflow & task-execution engine (now at initial release) drives
+these jobs. This document only enumerates the maintainable aspects and their
+remedies.
 
 Two independent categories:
 - **§8.2 Data-consistency management** — reconcile the DB against the two external
@@ -509,7 +769,9 @@ Two independent categories:
 ### 8.1 Single-bucket layout
 Staging and final storage share **one bucket** (multiple buckets would complicate
 configuration, not planned). The two populations are distinguished by **key
-prefix**: staging keys under a staging prefix, final keys under
+prefix**: staging keys under `<staging-prefix>/<ws-id>/…` (workspace-scoped by
+construction, so §6.1 step 2.1 can verify a supplied `staging_key` belongs to the
+target workspace with a plain prefix match), final keys under
 `<config prefix>/<ws-id>/…`. The bucket is a single service-level value; there is
 **no per-workspace bucket**. Reconciliation does **not** rely on a bucket
 lifecycle-expiry rule as a backstop — cleanup is the service's responsibility.
@@ -573,6 +835,11 @@ The forward purge path. Three operations, all idempotent and re-runnable (the
 external engine may retry any of them).
 
 **Invariants relied on:**
+- **A state transition to the same state is legal and idempotent** — any workspace
+  or artifact state transition may target the row's *current* state, so the same
+  transition code can run more than once without error (`X → X` is a no-op, not a
+  violation). This is what makes every step below safe to retry and makes a
+  re-run of a partially-applied step converge rather than fail.
 - **Object delete is idempotent** — deleting a backing object treats
   **404 / no-such-key as success**. This makes every purge step safe to re-run
   and lets a `MISSING_OBJECT → PENDING_PURGE` artifact (§2.2.1 — object already
@@ -592,9 +859,13 @@ run would not be mid-init). Init resets **all `PURGING` artifacts back to
 `PENDING_PURGE`** so they are re-picked next round. Safe precisely because object
 delete is idempotent (above).
 
-Workspaces need **no** such reset: a `PURGING` workspace is self-healing via the
-completion poll (§8.3.3), which re-evaluates it every round regardless of when it
-crashed.
+Workspaces need **no** such reset. The Phase-1 cascade is a **single atomic data
+transition** (§8.3.3), so a crash cannot strand a workspace with some artifacts
+still un-cascaded: the mark-all either committed or did not. If it committed, the
+completion poll (§8.3.3) re-evaluates the `PURGING` workspace every round and
+finishes it; if it did not commit, the workspace is still `PENDING_PURGE` (or is
+re-picked to `PURGING`, re-running the same idempotent cascade). Either way it
+converges without a dedicated reset.
 
 #### 8.3.2 Purging an artifact
 1. User marks the artifact for purging → `PENDING_PURGE` (§7.1 delete artifact).
@@ -607,8 +878,13 @@ Assumes the volume is already deleted (`VolumeState = NONE` invariant).
 
 - **Phase 1 — mark & cascade.** User marks the workspace for purging →
   `PENDING_PURGE`. Maintenance picks it up → `PURGING`, then marks **all its
-  artifacts** `PENDING_PURGE`. Phase ends. The workspace does **not** delete
-  objects itself — it relies on the artifact-purge task (§8.3.2) to drain them.
+  artifacts** `PENDING_PURGE` in a **single data transition** (one set-based
+  update over the workspace's artifacts, not a per-row loop). Because it is one
+  atomic statement, a crash cannot leave the cascade half-applied — it either
+  committed for all artifacts or none, and re-running it (per the idempotent
+  self-transition rule, §8.3) is a no-op on rows already `PENDING_PURGE`. Phase
+  ends. The workspace does **not** delete objects itself — it relies on the
+  artifact-purge task (§8.3.2) to drain them.
 - **Phase 2 — drain.** The artifact-purge task purges those artifacts on its own
   schedule.
 - **Phase 3 — completion poll.** Maintenance periodically re-examines `PURGING`
@@ -632,13 +908,14 @@ done, so this ordering just protects the row-deletion step itself.
 
 ## 9. Deferred / out of scope (for now)
 
-- **Maintenance scheduling** — how/when the jobs in §8 run is owned by a separate
-  workflow & task-execution engine, **not** this service.
+- **Maintenance scheduling** — how/when the jobs in §8 run is owned by the
+  **`tasking`** workflow & task-execution engine, **not** this service.
 - **Error taxonomy** — REST HTTP status codes and the MCP structured-error shape
   for the various refusals (mounted-volume, `VolumeState ≠ NONE`, name collision,
   no-volume precondition, …) are left to **implementation time**.
-- **`goutils` Docker factoring** — extract reusable Docker components shared by
-  `multitool`, `rest-pty`, and this service (§1) — separate effort.
+- ~~**`goutils` Docker factoring**~~ — **done:** the reusable Docker components
+  shared by `multitool`, `rest-pty`, and this service now live in
+  `goutils/runtime` (§1).
 - **Cross-tenant name-collision** — deployment concern, not solved in-service
   (§2.3).
 - **Multipart / massive uploads** — single-PUT size cap for the first cut (§5.2).
@@ -646,3 +923,12 @@ done, so this ordering just protects the row-deletion step itself.
   chaining tool → save → load across a pipeline (parked earlier).
 - **`resources/read` exposure of artifacts** — per-tool opt-in, now cleaner with
   an object store + DB behind it; not yet revisited.
+
+**Known prerequisites (not deferred — required before/with implementation):**
+- **goutils `GeneratePresignedGetURL` must accept response overrides** — today it
+  passes `nil` request parameters; it needs to thread
+  `response-content-disposition=attachment` (and optionally other `response-*`
+  overrides) into the presigned GET so cairn's serving discipline (§6.5) works.
+- **`X-Content-Type-Options: nosniff` is an OPS/serving-edge configuration** — it
+  cannot be set from the presigned GET URL (§6.5); the deployment (object-store
+  config or a fronting proxy/CDN) must add it. Documented, not enforced in-service.
