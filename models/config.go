@@ -94,21 +94,6 @@ type MetricsConfig struct {
 // ======================================================================================
 // Workspace Config
 
-// WorkspaceVolumeTypeENUM workspace persistence volume type
-type WorkspaceVolumeTypeENUM string
-
-const (
-	// WorkspaceVolumeTypeDocker workspace persistence volumes are docker volumes
-	WorkspaceVolumeTypeDocker WorkspaceVolumeTypeENUM = "docker"
-)
-
-// Values return all valid WorkspaceVolumeTypeENUM values
-func (WorkspaceVolumeTypeENUM) Values() []WorkspaceVolumeTypeENUM {
-	return []WorkspaceVolumeTypeENUM{
-		WorkspaceVolumeTypeDocker,
-	}
-}
-
 // WorkspaceManagerConfig workspace manager config
 type WorkspaceManagerConfig struct {
 	// VolumeType workspace persistence volume type. This controls the volume management driver

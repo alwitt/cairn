@@ -70,6 +70,9 @@ type NewWorkspaceParameter struct {
 	// AppName the per-deployment application name which namespaces this deployment's volumes.
 	// The workspace's persistent volume name is derived from it (see DESIGN §2.1).
 	AppName string
+	// VolumeMetadata optional provisioning parameters for the workspace's persistent volume.
+	// Nil takes the deployment's default provisioning parameters.
+	VolumeMetadata *models.WorkspaceVolumeMetadata
 }
 
 // NewArtifactParameter new artifact parameters
@@ -122,7 +125,8 @@ type Database interface {
 		stable across a workspace rename.
 
 		The new workspace starts with no persistent volume (`VolumeState = NONE`); the volume
-		is provisioned separately by the operator (see DESIGN §4.2).
+		is provisioned separately by the operator (see DESIGN §4.2). Any volume metadata given
+		here is recorded for that later provisioning to read.
 
 			@param ctx context.Context - execution context
 			@param params NewWorkspaceParameter - new workspace parameters
@@ -186,6 +190,23 @@ type Database interface {
 	*/
 	UpdateWorkspaceDescription(
 		ctx context.Context, workspaceID string, newDescription *string,
+	) error
+
+	/*
+		UpdateWorkspaceVolumeMeta change a workspace's persistent volume provisioning metadata.
+
+		Refused unless the workspace has no volume (`VolumeState = NONE`). The metadata is only
+		ever read when the volume is provisioned (see DESIGN §4.2), so editing it while a volume
+		is live would leave the record describing provisioning parameters the existing volume was
+		never created with - and nothing re-provisions to reconcile the two.
+
+			@param ctx context.Context - execution context
+			@param workspaceID string - workspace ID
+			@param newMetadata *models.WorkspaceVolumeMetadata - the new volume metadata, nil to
+			    clear it and take the deployment's default provisioning parameters
+	*/
+	UpdateWorkspaceVolumeMeta(
+		ctx context.Context, workspaceID string, newMetadata *models.WorkspaceVolumeMetadata,
 	) error
 
 	/*

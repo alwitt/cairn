@@ -158,6 +158,77 @@ func TestWorkspaceDefineNewWorkspace(t *testing.T) {
 		var validationError goutils.ValidationError
 		assert.True(errors.As(err, &validationError), "expected ValidationError, got %T", err)
 	}
+
+	// Case 6: a workspace defined without volume metadata leaves the column NULL - it takes
+	// the deployment's default provisioning parameters
+	assert.Nil(workspace0.VolumeMetadata)
+
+	// Case 7: volume metadata given at define time is recorded, and survives a round-trip
+	// through the JSON column
+	requestedSize := int64(4096)
+	var workspace7 models.Workspace
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			var err error
+			workspace7, err = dbClient.DefineNewWorkspace(ctx, db.NewWorkspaceParameter{
+				Name:           "unit-test-workspace-with-volume-meta",
+				AppName:        appName,
+				VolumeMetadata: &models.WorkspaceVolumeMetadata{SizeBytes: &requestedSize},
+			})
+			return err
+		},
+	))
+	assert.NotNil(workspace7.VolumeMetadata)
+	assert.NotNil(workspace7.VolumeMetadata.Data().SizeBytes)
+	assert.Equal(requestedSize, *workspace7.VolumeMetadata.Data().SizeBytes)
+
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			readBack, err := dbClient.GetWorkspace(ctx, workspace7.ID)
+			if err != nil {
+				return err
+			}
+			assert.NotNil(readBack.VolumeMetadata)
+			assert.NotNil(readBack.VolumeMetadata.Data().SizeBytes)
+			assert.Equal(requestedSize, *readBack.VolumeMetadata.Data().SizeBytes)
+			return nil
+		},
+	))
+
+	// Case 8: the metadata's own fields are validated. The `datatypes.JSONType` wrapper is
+	// opaque to the validator, so this only holds because the struct is checked before being
+	// wrapped - a regression here would silently persist a nonsense size.
+	for _, badSize := range []int64{0, -1} {
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				_, err := dbClient.DefineNewWorkspace(ctx, db.NewWorkspaceParameter{
+					Name:           fmt.Sprintf("unit-test-workspace-bad-size-%d", badSize),
+					AppName:        appName,
+					VolumeMetadata: &models.WorkspaceVolumeMetadata{SizeBytes: &badSize},
+				})
+				return err
+			},
+		)
+		assert.NotNil(err, "volume size %d should be rejected", badSize)
+		var validationError goutils.ValidationError
+		assert.True(errors.As(err, &validationError), "expected ValidationError, got %T", err)
+	}
+
+	// Case 9: metadata with no size set is valid - every field is optional
+	var workspace9 models.Workspace
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			var err error
+			workspace9, err = dbClient.DefineNewWorkspace(ctx, db.NewWorkspaceParameter{
+				Name:           "unit-test-workspace-empty-volume-meta",
+				AppName:        appName,
+				VolumeMetadata: &models.WorkspaceVolumeMetadata{},
+			})
+			return err
+		},
+	))
+	assert.NotNil(workspace9.VolumeMetadata)
+	assert.Nil(workspace9.VolumeMetadata.Data().SizeBytes)
 }
 
 func TestWorkspaceGetWorkspace(t *testing.T) {
@@ -587,6 +658,185 @@ func TestWorkspaceUpdateDescription(t *testing.T) {
 		))
 		assert.Len(events, 1)
 		assert.Equal(models.SystemEventTypeNewWorkspace, events[0].EventType)
+	}
+}
+
+func TestWorkspaceUpdateVolumeMeta(t *testing.T) {
+	assert := assert.New(t)
+	log.SetLevel(log.DebugLevel)
+
+	utCtx := context.Background()
+	testDB := fmt.Sprintf("/tmp/cairn_ut_%s.db", ulid.Make().String())
+	log.WithField("db", testDB).Debug("Test database")
+
+	persistence := getUnitTestPersistence(utCtx, t, testDB)
+
+	appName := fmt.Sprintf("ut-app-%s", ulid.Make().String())
+
+	originalSize := int64(4096)
+	var workspace0 models.Workspace
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			var err error
+			workspace0, err = dbClient.DefineNewWorkspace(ctx, db.NewWorkspaceParameter{
+				Name:           "unit-test-volume-meta",
+				AppName:        appName,
+				VolumeMetadata: &models.WorkspaceVolumeMetadata{SizeBytes: &originalSize},
+			})
+			return err
+		},
+	))
+
+	// helper: read the workspace's current volume metadata
+	readVolumeMeta := func() *models.WorkspaceVolumeMetadata {
+		var workspace models.Workspace
+		assert.Nil(persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				var err error
+				workspace, err = dbClient.GetWorkspace(ctx, workspace0.ID)
+				return err
+			},
+		))
+		if workspace.VolumeMetadata == nil {
+			return nil
+		}
+		stored := workspace.VolumeMetadata.Data()
+		return &stored
+	}
+
+	// Case 0: change the metadata while the workspace has no volume
+	newSize := int64(8192)
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			return dbClient.UpdateWorkspaceVolumeMeta(
+				ctx, workspace0.ID, &models.WorkspaceVolumeMetadata{SizeBytes: &newSize},
+			)
+		},
+	))
+	readBack := readVolumeMeta()
+	assert.NotNil(readBack)
+	assert.NotNil(readBack.SizeBytes)
+	assert.Equal(newSize, *readBack.SizeBytes)
+
+	// Case 1: nil metadata clears the column back to NULL, returning the workspace to the
+	// deployment's default provisioning parameters
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			return dbClient.UpdateWorkspaceVolumeMeta(ctx, workspace0.ID, nil)
+		},
+	))
+	assert.Nil(readVolumeMeta())
+
+	// Case 2: the new metadata is validated before it is stored
+	{
+		badSize := int64(0)
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateWorkspaceVolumeMeta(
+					ctx, workspace0.ID, &models.WorkspaceVolumeMetadata{SizeBytes: &badSize},
+				)
+			},
+		)
+		assert.NotNil(err)
+		var validationError goutils.ValidationError
+		assert.True(errors.As(err, &validationError), "expected ValidationError, got %T", err)
+		// the rejected write left the column as it was
+		assert.Nil(readVolumeMeta())
+	}
+
+	// Case 3: updating an unknown workspace surfaces a NotFoundError
+	{
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateWorkspaceVolumeMeta(
+					ctx, uuid.NewString(), &models.WorkspaceVolumeMetadata{SizeBytes: &newSize},
+				)
+			},
+		)
+		assert.NotNil(err)
+		var notFound goutils.NotFoundError
+		assert.True(errors.As(err, &notFound), "expected NotFoundError, got %T", err)
+	}
+
+	// Case 4: once the volume exists, the metadata is frozen. It is only read at provisioning
+	// time (DESIGN §4.2), so editing it now would leave the record describing parameters the
+	// live volume was never created with, with nothing to reconcile the two.
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			return dbClient.MarkWorkspaceVolumeReady(ctx, workspace0.ID)
+		},
+	))
+	{
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateWorkspaceVolumeMeta(
+					ctx, workspace0.ID, &models.WorkspaceVolumeMetadata{SizeBytes: &newSize},
+				)
+			},
+		)
+		assert.NotNil(err)
+		var consistencyError goutils.ConsistencyError
+		assert.True(
+			errors.As(err, &consistencyError), "expected ConsistencyError, got %T", err,
+		)
+		// the refused write left the column untouched
+		assert.Nil(readVolumeMeta())
+	}
+
+	// Case 5: clearing the metadata is refused on the same grounds - the guard is about the
+	// volume's existence, not about what is being written
+	{
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateWorkspaceVolumeMeta(ctx, workspace0.ID, nil)
+			},
+		)
+		assert.NotNil(err)
+		var consistencyError goutils.ConsistencyError
+		assert.True(
+			errors.As(err, &consistencyError), "expected ConsistencyError, got %T", err,
+		)
+	}
+
+	// Case 6: the metadata becomes editable again once the volume is gone
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			return dbClient.MarkWorkspaceVolumeNone(ctx, workspace0.ID)
+		},
+	))
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			return dbClient.UpdateWorkspaceVolumeMeta(
+				ctx, workspace0.ID, &models.WorkspaceVolumeMetadata{SizeBytes: &originalSize},
+			)
+		},
+	))
+	restored := readVolumeMeta()
+	assert.NotNil(restored)
+	assert.NotNil(restored.SizeBytes)
+	assert.Equal(originalSize, *restored.SizeBytes)
+
+	// Case 7: a metadata change is not an audited event in its own right. Only the setup's
+	// NEW_WORKSPACE and the two volume-state changes from cases 4 and 6 were recorded.
+	{
+		var events []models.SystemEventAudit
+		assert.Nil(persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				var err error
+				events, err = dbClient.ListSystemEvents(ctx, db.SystemEventQueryFilter{})
+				return err
+			},
+		))
+		assert.Len(events, 3)
+		eventTypes := []models.SystemEventTypeENUM{}
+		for _, event := range events {
+			eventTypes = append(eventTypes, event.EventType)
+		}
+		assert.Equal([]models.SystemEventTypeENUM{
+			models.SystemEventTypeNewWorkspace,
+			models.SystemEventTypeWorkspaceVolumeState,
+			models.SystemEventTypeWorkspaceVolumeState,
+		}, eventTypes)
 	}
 }
 

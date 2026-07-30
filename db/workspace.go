@@ -8,10 +8,38 @@ import (
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 )
 
 // ======================================================================================
 // Workspace
+
+/*
+buildVolumeMetadataColumn validate volume metadata and wrap it for the `volume_metadata`
+column, mapping nil onto a NULL column.
+
+The struct is validated here rather than through the enclosing `WorkspaceEntry`: the column's
+`datatypes.JSONType` wrapper is opaque to the validator, so a `validate` tag on the workspace
+field can't reach the fields inside. Every write path to the column goes through here so the
+check can't be skipped.
+
+	@param metadata *models.WorkspaceVolumeMetadata - the metadata to store, nil for none
+	@returns the column value to persist
+*/
+func (c *databaseImpl) buildVolumeMetadataColumn(
+	metadata *models.WorkspaceVolumeMetadata,
+) (*datatypes.JSONType[models.WorkspaceVolumeMetadata], error) {
+	if metadata == nil {
+		return nil, nil
+	}
+
+	if err := c.validator.Struct(metadata); err != nil {
+		return nil, err
+	}
+
+	wrapped := datatypes.NewJSONType(*metadata)
+	return &wrapped, nil
+}
 
 /*
 DefineNewWorkspace define a new workspace.
@@ -21,7 +49,8 @@ persisted, so no client ever guesses or re-derives it (see DESIGN §2.1). Derivi
 immutable ID rather than the name keeps it stable across a workspace rename.
 
 The new workspace starts with no persistent volume (`VolumeState = NONE`); the volume is
-provisioned separately by the operator (see DESIGN §4.2).
+provisioned separately by the operator (see DESIGN §4.2). Any volume metadata given here is
+recorded for that later provisioning to read.
 
 	@param ctx context.Context - execution context
 	@param params NewWorkspaceParameter - new workspace parameters
@@ -32,13 +61,21 @@ func (c *databaseImpl) DefineNewWorkspace(
 ) (models.Workspace, error) {
 	workspaceID := uuid.NewString()
 
+	volumeMetadata, err := c.buildVolumeMetadataColumn(params.VolumeMetadata)
+	if err != nil {
+		return models.Workspace{}, goutils.NewValidationError(
+			fmt.Sprintf("new workspace '%s' volume metadata is not valid", params.Name), err, true,
+		)
+	}
+
 	newEntry := WorkspaceEntry{
 		Workspace: models.Workspace{
-			ID:          workspaceID,
-			Name:        params.Name,
-			Description: params.Description,
-			VolumeName:  fmt.Sprintf("%s-%s", params.AppName, workspaceID),
-			VolumeState: models.WorkspaceVolumeStateNone,
+			ID:             workspaceID,
+			Name:           params.Name,
+			Description:    params.Description,
+			VolumeName:     fmt.Sprintf("%s-%s", params.AppName, workspaceID),
+			VolumeState:    models.WorkspaceVolumeStateNone,
+			VolumeMetadata: volumeMetadata,
 		},
 	}
 
@@ -236,6 +273,61 @@ func (c *databaseImpl) UpdateWorkspaceDescription(
 	if tmp.Error != nil {
 		return goutils.NewSQLError(
 			fmt.Sprintf("failed to update workspace %s description", workspaceID), tmp.Error, true,
+		)
+	}
+
+	return nil
+}
+
+/*
+UpdateWorkspaceVolumeMeta change a workspace's persistent volume provisioning metadata.
+
+Refused unless the workspace has no volume (`VolumeState = NONE`). The metadata is only ever
+read when the volume is provisioned (see DESIGN §4.2), so editing it while a volume is live
+would leave the record describing provisioning parameters the existing volume was never
+created with — and nothing re-provisions to reconcile the two.
+
+	@param ctx context.Context - execution context
+	@param workspaceID string - workspace ID
+	@param newMetadata *models.WorkspaceVolumeMetadata - the new volume metadata, nil to clear
+	    it and take the deployment's default provisioning parameters
+*/
+func (c *databaseImpl) UpdateWorkspaceVolumeMeta(
+	_ context.Context, workspaceID string, newMetadata *models.WorkspaceVolumeMetadata,
+) error {
+	entry, err := c.getWorkspaceDBEntry(workspaceID)
+	if err != nil {
+		return err
+	}
+
+	// The metadata describes how to provision a volume, so it is only editable while there is
+	// no volume to contradict it.
+	if entry.VolumeState != models.WorkspaceVolumeStateNone {
+		return goutils.NewConsistencyError(
+			fmt.Sprintf(
+				"workspace %s already has a persistent volume ('%s' is '%s'); "+
+					"its volume metadata can no longer be changed",
+				workspaceID, entry.VolumeName, entry.VolumeState,
+			), nil, true,
+		)
+	}
+
+	newColumn, err := c.buildVolumeMetadataColumn(newMetadata)
+	if err != nil {
+		return goutils.NewValidationError(
+			fmt.Sprintf("workspace %s new volume metadata is not valid", workspaceID), err, true,
+		)
+	}
+
+	tmp := c.db.
+		Model(&WorkspaceEntry{}).
+		Where("id = ?", entry.ID).
+		UpdateColumn("volume_metadata", newColumn)
+	if tmp.Error != nil {
+		return goutils.NewSQLError(
+			fmt.Sprintf("failed to update workspace %s volume metadata", workspaceID),
+			tmp.Error,
+			true,
 		)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/alwitt/goutils"
+	"gorm.io/datatypes"
 )
 
 // WorkspaceVolumeStateENUM workspace persistent volume state ENUM
@@ -27,6 +28,38 @@ func (WorkspaceVolumeStateENUM) Values() []WorkspaceVolumeStateENUM {
 	}
 }
 
+// WorkspaceVolumeTypeENUM workspace persistence volume type
+type WorkspaceVolumeTypeENUM string
+
+const (
+	// WorkspaceVolumeTypeDocker workspace persistence volumes are docker volumes
+	WorkspaceVolumeTypeDocker WorkspaceVolumeTypeENUM = "docker"
+)
+
+// Values return all valid WorkspaceVolumeTypeENUM values
+func (WorkspaceVolumeTypeENUM) Values() []WorkspaceVolumeTypeENUM {
+	return []WorkspaceVolumeTypeENUM{
+		WorkspaceVolumeTypeDocker,
+	}
+}
+
+// WorkspaceVolumeMetadata per-workspace provisioning parameters for the persistent volume.
+//
+// Runtime-neutral by construction: it carries only what a caller may legitimately vary
+// between workspaces. Everything else needed to provision a volume - the Docker volume
+// driver and its options, or the Kubernetes storage class and access modes - is deployment
+// policy that is identical for every workspace, so it lives in the application config
+// rather than being copied onto every row.
+//
+// The volume's name is deliberately absent; it lives in `Workspace.VolumeName`, derived
+// from the immutable workspace ID (DESIGN §2.1), and must stay single-sourced.
+type WorkspaceVolumeMetadata struct {
+	// SizeBytes requested capacity for the volume. Honored as a storage request by
+	// Kubernetes and by capacity-aware Docker volume drivers; the default Docker `local`
+	// driver treats it as advisory.
+	SizeBytes *int64 `json:"size_bytes,omitempty" validate:"omitempty,gt=0" jsonschema:"requested capacity for the volume in bytes; must be > 0 when set. Advisory for the default docker volume driver."`
+}
+
 // Workspace is a collection of agent facing artifacts
 type Workspace struct {
 	// ID workspace ID
@@ -44,6 +77,10 @@ type Workspace struct {
 
 	// VolumeState workspace persistent volume state [NONE, READY]
 	VolumeState WorkspaceVolumeStateENUM `json:"volume_state" gorm:"column:volume_state;not null;default:NONE" validate:"required,volume_state" jsonschema:"workspace persistent volume state. NONE: no volume exists. READY: volume exists and is mountable."`
+
+	// VolumeMetadata persistence volume metadata for configuring the persistent volume.
+	// Nil when the workspace takes the deployment's default provisioning parameters.
+	VolumeMetadata *datatypes.JSONType[WorkspaceVolumeMetadata] `json:"volume_metadata,omitempty" gorm:"column:volume_metadata;default:null" validate:"omitempty" jsonschema:"persistence volume metadata for configuring the persistent volume; omitted when the workspace takes the deployment defaults"`
 
 	// CreatedAt entry creation timestamp
 	CreatedAt time.Time `json:"created_at"`
