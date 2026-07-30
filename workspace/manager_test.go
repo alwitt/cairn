@@ -11,10 +11,13 @@ import (
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/cairn/workspace"
 	"github.com/alwitt/goutils"
+	mockruntime "github.com/alwitt/goutils/mocks/runtime"
+	"github.com/alwitt/goutils/runtime"
 	"github.com/apex/log"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"gorm.io/datatypes"
 )
 
 // unitTestAppName the application name the harness manager is built with. It prefixes every
@@ -33,16 +36,37 @@ func runTxForManager(
 }
 
 // newUnitTestManager build a Manager backed by a mock persistence client, returning both so a
-// test can set expectations on the client.
+// test can set expectations on the client. The volume manager is mocked with no expectations
+// set, so any unexpected volume operation fails the test.
 func newUnitTestManager(t *testing.T) (workspace.Manager, *mockdb.Client) {
+	manager, mockClient, _ := newUnitTestManagerWithVolumes(t)
+	return manager, mockClient
+}
+
+// newUnitTestManagerWithVolumes build a Manager backed by mock persistence and volume
+// clients, returning all three so a test can set expectations on either.
+func newUnitTestManagerWithVolumes(
+	t *testing.T,
+) (workspace.Manager, *mockdb.Client, *mockruntime.VolumeManager) {
 	assert := assert.New(t)
 
 	mockClient := mockdb.NewClient(t)
-	manager, err := workspace.NewManager(unitTestAppName, mockClient)
+	mockVolumes := mockruntime.NewVolumeManager(t)
+	manager, err := workspace.NewManager(unitTestAppName, mockClient, mockVolumes)
 	assert.Nil(err)
 	assert.NotNil(manager)
 
-	return manager, mockClient
+	return manager, mockClient, mockVolumes
+}
+
+// expectVolumeMountLookup arrange the volume lookup that every successful workspace fetch
+// performs to estimate the mount count (see DESIGN §7.1), reporting the given mounters.
+func expectVolumeMountLookup(
+	mockVolumes *mockruntime.VolumeManager, entry models.Workspace, mounters []string,
+) {
+	mockVolumes.EXPECT().
+		GetVolume(mock.Anything, entry.VolumeName).
+		Return(runtime.ContainerVolume{Name: entry.VolumeName}, mounters, nil)
 }
 
 // sampleWorkspace build a workspace entry of the shape persistence returns, with the volume name
@@ -55,6 +79,36 @@ func sampleWorkspace(name string) models.Workspace {
 		VolumeName:  fmt.Sprintf("%s-%s", unitTestAppName, workspaceID),
 		VolumeState: models.WorkspaceVolumeStateNone,
 	}
+}
+
+// sampleWorkspaceWithVolumeSize build a workspace entry carrying a requested volume capacity, of
+// the shape persistence returns once the volume_metadata column is populated.
+func sampleWorkspaceWithVolumeSize(name string, sizeBytes int64) models.Workspace {
+	entry := sampleWorkspace(name)
+	metadata := datatypes.NewJSONType(
+		models.WorkspaceVolumeMetadata{SizeBytes: &sizeBytes},
+	)
+	entry.VolumeMetadata = &metadata
+	return entry
+}
+
+// assertManagerDockerError verify an error is a WorkspaceMangerError wrapping a DockerError which
+// still carries the original Docker failure. Volume operations stack those two layers the way DB
+// operations stack WorkspaceMangerError over PersistenceError.
+func assertManagerDockerError(assert *assert.Assertions, err error, wrapped error) {
+	assert.NotNil(err)
+
+	var managerErr models.WorkspaceMangerError
+	assert.True(
+		errors.As(err, &managerErr), "expected WorkspaceMangerError, got %T: %v", err, err,
+	)
+
+	var dockerErr goutils.DockerError
+	assert.True(errors.As(err, &dockerErr), "expected DockerError, got %T: %v", err, err)
+
+	assert.Contains(
+		err.Error(), wrapped.Error(), "docker error should survive to the top of the chain",
+	)
 }
 
 // assertManagerError verify an error is a WorkspaceMangerError wrapping a PersistenceError which
@@ -89,7 +143,9 @@ func TestNewManager(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, err := workspace.NewManager(unitTestAppName, mockdb.NewClient(t))
+		manager, err := workspace.NewManager(
+			unitTestAppName, mockdb.NewClient(t), mockruntime.NewVolumeManager(t),
+		)
 		assert.Nil(err)
 		assert.NotNil(manager)
 	})
@@ -101,7 +157,9 @@ func TestNewManager(t *testing.T) {
 		assert := assert.New(t)
 
 		for _, appName := range []string{"", "has space", "has/slash", "has.dot"} {
-			manager, err := workspace.NewManager(appName, mockdb.NewClient(t))
+			manager, err := workspace.NewManager(
+				appName, mockdb.NewClient(t), mockruntime.NewVolumeManager(t),
+			)
 			assert.Nil(manager, "application name '%s' should be rejected", appName)
 			assert.NotNil(err, "application name '%s' should be rejected", appName)
 
@@ -115,7 +173,17 @@ func TestNewManager(t *testing.T) {
 	t.Run("nil persistence client rejected", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, err := workspace.NewManager(unitTestAppName, nil)
+		manager, err := workspace.NewManager(
+			unitTestAppName, nil, mockruntime.NewVolumeManager(t),
+		)
+		assert.Nil(manager)
+		assert.NotNil(err)
+	})
+
+	t.Run("nil volume manager rejected", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, err := workspace.NewManager(unitTestAppName, mockdb.NewClient(t), nil)
 		assert.Nil(manager)
 		assert.NotNil(err)
 	})
@@ -135,8 +203,9 @@ func TestManagerActiveSession(t *testing.T) {
 	t.Run("existing session is used directly", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _ := newUnitTestManager(t)
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
+		expectVolumeMountLookup(mockVolumes, entry, nil)
 
 		activeSession := mockdb.NewDatabase(t)
 		activeSession.EXPECT().GetWorkspace(mock.Anything, entry.ID).Return(entry, nil)
@@ -150,8 +219,9 @@ func TestManagerActiveSession(t *testing.T) {
 	t.Run("nil session opens a transaction", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient := newUnitTestManager(t)
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
+		expectVolumeMountLookup(mockVolumes, entry, nil)
 
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().GetWorkspace(mock.Anything, entry.ID).Return(entry, nil)
@@ -269,7 +339,7 @@ func TestManagerGetWorkspace(t *testing.T) {
 	t.Run("fetch by ID", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient := newUnitTestManager(t)
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockDatabase := mockdb.NewDatabase(t)
@@ -278,13 +348,39 @@ func TestManagerGetWorkspace(t *testing.T) {
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase))
 
+		// Only Docker can answer the mount count - the volume is mounted by client services
+		// the manager never launched (see DESIGN §4.3), so the count is whatever the volume
+		// manager reports.
+		expectVolumeMountLookup(mockVolumes, entry, []string{"holder-a", "holder-b"})
+
 		got, mountCount, err := manager.GetWorkspace(utCtx, entry.ID, nil)
 		assert.Nil(err)
 		assert.Equal(entry.ID, got.ID)
 		assert.Equal(entry.VolumeName, got.VolumeName)
-		// Only Docker can answer the mount count, and the manager holds no VolumeManager yet,
-		// so it reports the unavailable sentinel rather than a count it can't substantiate
-		// (see DESIGN §4.3).
+		assert.Equal(2, mountCount)
+	})
+
+	// Docker being unreachable must not fail a workspace fetch; the count degrades to the
+	// unavailable sentinel instead (see DESIGN §7.1).
+	t.Run("mount count unavailable", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().GetWorkspace(mock.Anything, entry.ID).Return(entry, nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, fmt.Errorf("docker is unreachable"))
+
+		got, mountCount, err := manager.GetWorkspace(utCtx, entry.ID, nil)
+		assert.Nil(err, "a fetch must still answer when the volume lookup fails")
+		assert.Equal(entry.ID, got.ID)
 		assert.Equal(-1, mountCount)
 	})
 
@@ -328,7 +424,7 @@ func TestManagerGetWorkspaceByName(t *testing.T) {
 	t.Run("fetch by name", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient := newUnitTestManager(t)
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockDatabase := mockdb.NewDatabase(t)
@@ -337,11 +433,15 @@ func TestManagerGetWorkspaceByName(t *testing.T) {
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase))
 
+		// The mount count is looked up against the volume name the entry carries, not the
+		// workspace name the caller resolved by.
+		expectVolumeMountLookup(mockVolumes, entry, []string{"holder-a"})
+
 		got, mountCount, err := manager.GetWorkspaceByName(utCtx, entry.Name, nil)
 		assert.Nil(err)
 		assert.Equal(entry.ID, got.ID)
 		assert.Equal(entry.Name, got.Name)
-		assert.Equal(-1, mountCount)
+		assert.Equal(1, mountCount)
 	})
 
 	t.Run("unknown workspace name", func(t *testing.T) {
@@ -683,5 +783,398 @@ func TestManagerDeleteWorkspace(t *testing.T) {
 		assert.True(
 			errors.As(err, &notFoundErr), "expected NotFoundError, got %T: %v", err, err,
 		)
+	})
+}
+
+// TestManagerSetupWorkspaceVolume validates volume provisioning. The manager consults Docker for
+// existence rather than trusting the entry's VolumeState, so the column can never block the
+// operation that would repair it (see DESIGN §4.2, §8.2.2).
+func TestManagerSetupWorkspaceVolume(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+	utCtx := context.Background()
+
+	// Case 1: no volume yet - define one, then record the workspace as READY. The define must
+	// use the entry's stored, ID-derived volume name (see DESIGN §2.1).
+	t.Run("defines a missing volume", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, goutils.NewNotFoundError(
+				fmt.Sprintf("docker volume '%s' not found", entry.VolumeName), nil, true,
+			))
+		mockVolumes.EXPECT().
+			DefineVolume(
+				mock.Anything, runtime.ContainerVolume{Name: entry.VolumeName}, nil,
+			).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, nil))
+	})
+
+	// Case 2: a requested capacity reaches Docker. This is the only consumer of the
+	// volume_metadata column, so a regression here would silently ignore what the caller asked
+	// for.
+	t.Run("requested size reaches the volume manager", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspaceWithVolumeSize("unit-test-workspace", 4096)
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, goutils.NewNotFoundError("absent", nil, true))
+		mockVolumes.EXPECT().
+			DefineVolume(
+				mock.Anything,
+				runtime.ContainerVolume{Name: entry.VolumeName, Size: 4096},
+				nil,
+			).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, nil))
+	})
+
+	// Case 3: the volume already exists - adopt it. Re-creating is unnecessary and DELETING it
+	// to start clean is the auto-reap DESIGN §4.2 forbids, so DefineVolume must not be called.
+	// The mock has no DefineVolume expectation, so any call fails the test.
+	t.Run("adopts an existing volume", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		// Adoption still records READY - that is what repairs a workspace whose column drifted
+		// to NONE while its volume lived on (see DESIGN §8.2.2).
+		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, nil))
+	})
+
+	// Case 4: a failed define must not be recorded. The column may only claim READY after
+	// Docker has actually provisioned the volume (see DESIGN §4.2), so persistence is never
+	// reached - the mock client has no expectations set.
+	t.Run("no state write when the define fails", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		dockerFailure := fmt.Errorf("docker daemon refused")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, goutils.NewNotFoundError("absent", nil, true))
+		mockVolumes.EXPECT().
+			DefineVolume(mock.Anything, mock.Anything, mock.Anything).
+			Return(runtime.ContainerVolume{}, dockerFailure)
+
+		err := manager.SetupWorkspaceVolume(utCtx, entry, nil)
+		assertManagerDockerError(assert, err, dockerFailure)
+	})
+
+	// Case 5: a failed existence check aborts before anything is created or recorded. Unlike
+	// the mount-count estimate, this failure cannot be shrugged off - provisioning on top of an
+	// unknown state risks colliding with a volume that is already there.
+	t.Run("inspect failure aborts the setup", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		dockerFailure := fmt.Errorf("docker is unreachable")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, dockerFailure)
+
+		err := manager.SetupWorkspaceVolume(utCtx, entry, nil)
+		assertManagerDockerError(assert, err, dockerFailure)
+	})
+
+	// Case 6: a persistence failure after a successful define is surfaced, wrapped the way
+	// every other DB failure is.
+	t.Run("persistence failure is wrapped", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		dbFailure := fmt.Errorf("database is locked")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			MarkWorkspaceVolumeReady(mock.Anything, entry.ID).
+			Return(dbFailure)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		err := manager.SetupWorkspaceVolume(utCtx, entry, nil)
+		assertManagerError(assert, err, dbFailure)
+	})
+
+	// Case 7: an existing session is used directly - the manager must not open a second
+	// transaction. The mock client has no expectations set, so any call to it fails the test.
+	t.Run("existing session is used directly", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+
+		activeSession := mockdb.NewDatabase(t)
+		activeSession.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
+
+		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, activeSession))
+	})
+}
+
+// TestManagerListWorkspaceVolumes validates the deployment-scoped volume listing.
+func TestManagerListWorkspaceVolumes(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+	utCtx := context.Background()
+
+	// Case 1: volumes are selected by the deployment's `<app name>-` prefix (see DESIGN §2.1)
+	// and returned by name. The prefix is asserted exactly - a wrong one would either miss this
+	// deployment's volumes or sweep in another's.
+	t.Run("lists by the application name prefix", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		expectedPrefix := fmt.Sprintf("%s-", unitTestAppName)
+
+		mockVolumes.EXPECT().
+			ListVolumes(mock.Anything, &expectedPrefix).
+			Return([]runtime.ContainerVolume{
+				{Name: unitTestAppName + "-ws-0"},
+				{Name: unitTestAppName + "-ws-1"},
+			}, nil)
+
+		names, err := manager.ListWorkspaceVolumes(utCtx)
+		assert.Nil(err)
+		assert.Equal(
+			[]string{unitTestAppName + "-ws-0", unitTestAppName + "-ws-1"}, names,
+		)
+	})
+
+	// Case 2: nothing observed is an empty list, not an error.
+	t.Run("empty listing", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+
+		mockVolumes.EXPECT().
+			ListVolumes(mock.Anything, mock.Anything).
+			Return([]runtime.ContainerVolume{}, nil)
+
+		names, err := manager.ListWorkspaceVolumes(utCtx)
+		assert.Nil(err)
+		assert.Empty(names)
+	})
+
+	// Case 3: a Docker failure is surfaced wrapped, not swallowed into an empty listing - a
+	// caller reconciling against this must not read "no volumes" from a failed query.
+	t.Run("docker failure is wrapped", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		dockerFailure := fmt.Errorf("docker is unreachable")
+
+		mockVolumes.EXPECT().
+			ListVolumes(mock.Anything, mock.Anything).
+			Return(nil, dockerFailure)
+
+		names, err := manager.ListWorkspaceVolumes(utCtx)
+		assert.Nil(names)
+		assertManagerDockerError(assert, err, dockerFailure)
+	})
+}
+
+// TestManagerTeardownWorkspaceVolume validates volume removal and, above all, the refusal path:
+// the daemon's in-use check is the authoritative teardown gate (see DESIGN §4.3).
+func TestManagerTeardownWorkspaceVolume(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+	utCtx := context.Background()
+
+	// Case 1: an existing volume is deleted, then the workspace is recorded as having none.
+	// The delete must never force - the daemon's refusal is the guard (see DESIGN §4.3).
+	t.Run("deletes an existing volume", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+		mockVolumes.EXPECT().
+			DeleteVolume(mock.Anything, entry.VolumeName, false).
+			Return(nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().MarkWorkspaceVolumeNone(mock.Anything, entry.ID).Return(nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		assert.Nil(manager.TeardownWorkspaceVolume(utCtx, entry, nil))
+	})
+
+	// Case 2: the volume is already gone - record it and move on. This is what repairs a
+	// workspace whose column drifted to READY after its volume vanished (see DESIGN §8.2.2).
+	// The mock has no DeleteVolume expectation, so any call fails the test.
+	t.Run("absent volume is not an error", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, goutils.NewNotFoundError(
+				fmt.Sprintf("docker volume '%s' not found", entry.VolumeName), nil, true,
+			))
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().MarkWorkspaceVolumeNone(mock.Anything, entry.ID).Return(nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		assert.Nil(manager.TeardownWorkspaceVolume(utCtx, entry, nil))
+	})
+
+	// Case 3: the hard guard. A still-mounted volume is refused by the daemon as a
+	// ConsistencyError, and that must reach the caller intact - the operator needs to know to
+	// stop the mounters first, not merely that teardown failed (see DESIGN §4.3). Crucially the
+	// column is NOT written: the mock client has no expectations, so a state write fails the
+	// test.
+	t.Run("mounted volume refusal is surfaced", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		refusal := goutils.NewConsistencyError(
+			fmt.Sprintf(
+				"docker volume '%s' is currently mounted and can't be deleted without force",
+				entry.VolumeName,
+			), nil, true,
+		)
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+		mockVolumes.EXPECT().
+			DeleteVolume(mock.Anything, entry.VolumeName, false).
+			Return(refusal)
+
+		err := manager.TeardownWorkspaceVolume(utCtx, entry, nil)
+		assert.NotNil(err)
+
+		var managerErr models.WorkspaceMangerError
+		assert.True(
+			errors.As(err, &managerErr), "expected WorkspaceMangerError, got %T: %v", err, err,
+		)
+
+		var consistencyErr goutils.ConsistencyError
+		assert.True(
+			errors.As(err, &consistencyErr), "expected ConsistencyError, got %T: %v", err, err,
+		)
+		assert.Contains(err.Error(), refusal.Error())
+	})
+
+	// Case 4: a failed existence check aborts before anything is deleted or recorded.
+	t.Run("inspect failure aborts the teardown", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		dockerFailure := fmt.Errorf("docker is unreachable")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, dockerFailure)
+
+		err := manager.TeardownWorkspaceVolume(utCtx, entry, nil)
+		assertManagerDockerError(assert, err, dockerFailure)
+	})
+
+	// Case 5: a persistence failure after a successful delete is surfaced.
+	t.Run("persistence failure is wrapped", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		dbFailure := fmt.Errorf("database is locked")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+		mockVolumes.EXPECT().
+			DeleteVolume(mock.Anything, entry.VolumeName, false).
+			Return(nil)
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			MarkWorkspaceVolumeNone(mock.Anything, entry.ID).
+			Return(dbFailure)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		err := manager.TeardownWorkspaceVolume(utCtx, entry, nil)
+		assertManagerError(assert, err, dbFailure)
+	})
+
+	// Case 6: an existing session is used directly - the manager must not open a second
+	// transaction. The mock client has no expectations set, so any call to it fails the test.
+	t.Run("existing session is used directly", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+		mockVolumes.EXPECT().
+			DeleteVolume(mock.Anything, entry.VolumeName, false).
+			Return(nil)
+
+		activeSession := mockdb.NewDatabase(t)
+		activeSession.EXPECT().MarkWorkspaceVolumeNone(mock.Anything, entry.ID).Return(nil)
+
+		assert.Nil(manager.TeardownWorkspaceVolume(utCtx, entry, activeSession))
 	})
 }

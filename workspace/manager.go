@@ -9,6 +9,7 @@ import (
 	"github.com/alwitt/cairn/db"
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
+	"github.com/alwitt/goutils/runtime"
 	"github.com/apex/log"
 	"github.com/go-playground/validator/v10"
 )
@@ -127,6 +128,69 @@ type Manager interface {
 			    within it.
 	*/
 	DeleteWorkspace(ctx context.Context, workspaceID string, activeSession db.Database) error
+
+	/*
+		SetupWorkspaceVolume provision a workspace's persistent volume and record that it is
+		ready.
+
+		Idempotent (see DESIGN §4.2): a volume that already exists is adopted rather than
+		re-created, so this also repairs a workspace whose `VolumeState` drifted to `NONE`
+		while its volume lived on (see DESIGN §8.2.2).
+
+		The volume is created before the state column is written, so the column is only ever
+		set `READY` after Docker has actually provisioned it (see DESIGN §4.2). One
+		consequence of that ordering: when run inside an `activeSession`, a later rollback of
+		that transaction undoes the column write but not the volume - reconciliation is what
+		settles the difference.
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - the workspace whose volume to provision
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+	*/
+	SetupWorkspaceVolume(
+		ctx context.Context, workspace models.Workspace, activeSession db.Database,
+	) error
+
+	/*
+		ListWorkspaceVolumes return the names of the observed persistent volumes belonging to
+		this deployment.
+
+		Selected by the `<app name>-` prefix every workspace volume name carries (see DESIGN
+		§2.1), so the result may include volumes this deployment never created - an orphan
+		left by a prior incarnation still matches. That is the point: it backs the
+		reconciliation that spots volumes Docker holds but the DB does not (see DESIGN §8.2.2).
+
+			@param ctx context.Context - execution context
+			@returns the names of the observed volumes
+	*/
+	ListWorkspaceVolumes(ctx context.Context) ([]string, error)
+
+	/*
+		TeardownWorkspaceVolume delete a workspace's persistent volume and record that it is
+		gone.
+
+		Refused while any entity still mounts the volume - the Docker daemon decides that
+		atomically as part of the removal, so there is no TOCTOU window (see DESIGN §4.3). A
+		refusal surfaces as a `goutils.ConsistencyError` and leaves `VolumeState` untouched.
+
+		Idempotent (see DESIGN §4.2): a volume that is already gone is not an error, so this
+		also repairs a workspace whose `VolumeState` drifted to `READY` after its volume
+		vanished (see DESIGN §8.2.2).
+
+		The volume is removed before the state column is written; see `SetupWorkspaceVolume`
+		for what that ordering means inside an `activeSession`.
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - the workspace whose volume to remove
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+	*/
+	TeardownWorkspaceVolume(
+		ctx context.Context, workspace models.Workspace, activeSession db.Database,
+	) error
 }
 
 // managerImpl implements Manager
@@ -138,14 +202,17 @@ type managerImpl struct {
 	validator *validator.Validate
 
 	persistence db.Client
+
+	// volumes manages the persistent volumes backing workspaces. The manager operates it but
+	// does not own its lifecycle - the caller performs `Start` and `Cleanup`.
+	volumes runtime.VolumeManager
 }
 
 // unknownVolumeMountCount the mount-count estimate reported when the number of entities
 // mounting a workspace's persistent volume can't be determined.
 //
 // Docker itself reports `-1` for an unavailable `RefCount` (see DESIGN §4.3), so the same
-// sentinel carries through. Until the manager holds a `VolumeManager` to ask, every fetch
-// reports it.
+// sentinel carries through.
 const unknownVolumeMountCount = -1
 
 /*
@@ -155,9 +222,14 @@ NewManager define a new workspace manager
 	    deployment's persistent volumes. A workspace's volume name is derived from it (see
 	    DESIGN §2.1).
 	@param persistence db.Client - persistence client
+	@param volumes runtime.VolumeManager - manager for the persistent volumes backing
+	    workspaces. Its lifecycle is the caller's responsibility; it must already be started,
+	    and this manager never tears it down.
 	@returns the new workspace manager
 */
-func NewManager(appName string, persistence db.Client) (Manager, error) {
+func NewManager(
+	appName string, persistence db.Client, volumes runtime.VolumeManager,
+) (Manager, error) {
 	logTags := log.Fields{
 		"package": "cairn", "module": "workspace", "component": "manager", "instance": appName,
 	}
@@ -181,6 +253,10 @@ func NewManager(appName string, persistence db.Client) (Manager, error) {
 		return nil, goutils.NewValidationError("persistence client is required", nil, true)
 	}
 
+	if volumes == nil {
+		return nil, goutils.NewValidationError("volume manager is required", nil, true)
+	}
+
 	instance := &managerImpl{
 		Component: goutils.Component{
 			LogTags: logTags,
@@ -191,6 +267,7 @@ func NewManager(appName string, persistence db.Client) (Manager, error) {
 		appName:     appName,
 		validator:   validate,
 		persistence: persistence,
+		volumes:     volumes,
 	}
 
 	return instance, nil
@@ -312,11 +389,27 @@ func (m *managerImpl) GetWorkspaceByName(
 // persistent volume.
 //
 // Only Docker can answer this - the volume is mounted by client services the manager never
-// launched, so the DB has no record of it (see DESIGN §4.3). Until the manager embeds a
-// `VolumeManager` to ask, it reports the unavailable sentinel rather than a count it can't
-// substantiate.
-func (m *managerImpl) estimateVolumeMountCount(_ context.Context, _ models.Workspace) int {
-	return unknownVolumeMountCount
+// launched, so the DB has no record of it (see DESIGN §4.3).
+//
+// Every failure, including the volume simply not existing, reports the unavailable sentinel
+// instead of propagating: this only ever decorates a workspace fetch, and a fetch must still
+// answer when Docker is unreachable (see DESIGN §7.1).
+func (m *managerImpl) estimateVolumeMountCount(
+	ctx context.Context, workspace models.Workspace,
+) int {
+	logTags := m.GetLogTagsForContext(ctx)
+
+	_, mounters, err := m.volumes.GetVolume(ctx, workspace.VolumeName)
+	if err != nil {
+		log.
+			WithError(err).
+			WithFields(logTags).
+			WithField("volume", workspace.VolumeName).
+			Debug("Unable to estimate volume mount count")
+		return unknownVolumeMountCount
+	}
+
+	return len(mounters)
 }
 
 /*
