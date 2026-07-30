@@ -34,6 +34,12 @@ func RegisterWithValidator(v *validator.Validate) error {
 		return err
 	}
 
+	if err := goutils.RegisterENUMInValidator(
+		v, "workspace_volume_type", goutils.ValidateStringENUM[WorkspaceVolumeTypeENUM](),
+	); err != nil {
+		return err
+	}
+
 	if err := v.RegisterValidation(
 		"valid_name", validateNameType,
 	); err != nil {
