@@ -36,7 +36,7 @@ type Workspace struct {
 	Name string `json:"name" gorm:"column:name;not null;unique" validate:"required,valid_name" jsonschema:"name of the workspace, can only contain alphanumeric characters, -, and _"`
 
 	// Description an optional description for the workspace
-	Description *string `json:"description" gorm:"column:description;default:null" jsonschema:"an optional description for the workspace"`
+	Description *string `json:"description,omitempty" gorm:"column:description;default:null" jsonschema:"an optional description for the workspace"`
 
 	// VolumeName name of the persistent volume associated with workspace. It is not tied to
 	// the name of the workspace.

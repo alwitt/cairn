@@ -10,4 +10,7 @@ recursive: false
 require-template-schema-exists: true
 template: testify
 template-schema: '{{.Template}}.schema.json'
-packages: {}
+packages:
+  github.com/alwitt/cairn/db:
+    config:
+      all: true

@@ -28,6 +28,12 @@ func RegisterWithValidator(v *validator.Validate) error {
 		return err
 	}
 
+	if err := goutils.RegisterENUMInValidator(
+		v, "system_event_type", goutils.ValidateStringENUM[SystemEventTypeENUM](),
+	); err != nil {
+		return err
+	}
+
 	if err := v.RegisterValidation(
 		"valid_name", validateNameType,
 	); err != nil {

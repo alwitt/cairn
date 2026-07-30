@@ -33,12 +33,9 @@ type Artifact struct {
 	// ID artifact ID
 	ID string `json:"id" gorm:"column:id;primaryKey" validate:"required"`
 
-	// WorkspaceID ID of the parent workspace
+	// WorkspaceID ID of the parent workspace. The parent association, and with it the
+	// ON DELETE CASCADE constraint, is declared on the persistence layer's `ArtifactEntry`.
 	WorkspaceID string `json:"workspace_id" gorm:"column:workspace_id;not null;uniqueIndex:artifact_workspace_name" validate:"required,uuid"`
-
-	// Workspace parent workspace association; carries the ON DELETE CASCADE constraint so an
-	// artifact's row is removed with its workspace. Not serialized, not validated.
-	Workspace *Workspace `json:"-" gorm:"constraint:OnDelete:CASCADE;foreignKey:WorkspaceID" validate:"-"`
 
 	// Name of the artifact, unique within the workspace, can only contain alphanumeric
 	// characters, `-`, and `_`
