@@ -156,7 +156,7 @@ func (m *managerImpl) RegisterNewArtifact(
 	}
 
 	// Prove the caller is not pointing at another workspace's staging object.
-	if err := m.verifyStagingKeyOwnership(workspace, stagingObjKey); err != nil {
+	if err := m.verifyStagingKeyOwnership(workspace.ID, stagingObjKey); err != nil {
 		return failure(err)
 	}
 
@@ -232,4 +232,137 @@ func (m *managerImpl) RegisterNewArtifact(
 		Debug("Registered new artifact")
 
 	return newEntry, nil
+}
+
+/*
+UpdateArtifactContent replace an existing artifact's content with a newly staged object.
+
+This is `RegisterNewArtifact` minus the insert: the artifact entry already exists, so the
+function only needs to determine the newly staged object's size and MIME type, copy it
+into a new final storage object key, and repoint the entry at it (see DESIGN §6.3).
+
+Every pre-copy check `RegisterNewArtifact` performs applies here unchanged - the staging
+object key is verified as belonging to this artifact's workspace, and the object's
+measured size is checked against the single-PUT size cap before anything is copied, so an
+over-cap object never reaches the entry (see DESIGN §7.5).
+
+The content is always copied to a NEW final object key rather than over the existing one.
+The entry is then flipped to the new key in a single update, so a reader never observes it
+pointing at a half-written object. The old object is left behind by design; the
+object-reaping GC reclaims it as an aged final object with no backing row (see DESIGN
+§6.2, §6.3, §8.2.1).
+
+Concurrent updates are last-writer-wins. Each writer copies to its own new key, and the
+final entry update decides the winner; the loser's object is reclaimed the same way. There
+is no optimistic locking (see DESIGN §7.5.2).
+
+An artifact quarantined as `MISSING_OBJECT` is a legitimate target: re-uploading its bytes
+is exactly how it is brought back into service. The state transition is validated by the
+persistence layer, so no state gate is applied here.
+
+	@param ctx context.Context - execution context
+	@param artifact models.Artifact - the artifact to update
+	@param stagingObjKey string - the staging object returned by `GetArtifactStagingPutURL`.
+	    The system expects the artifact entry's new data file is stored at this location
+	    already.
+	@param activeSession db.Database - if set, this is an existing open DB persistence
+	    layer transaction, and function will perform additional persistence operations
+	    within it.
+	@returns the updated artifact entry
+*/
+func (m *managerImpl) UpdateArtifactContent(
+	ctx context.Context,
+	artifact models.Artifact,
+	stagingObjKey string,
+	activeSession db.Database,
+) (models.Artifact, error) {
+	logTags := m.GetLogTagsForContext(ctx)
+
+	failure := func(err error) (models.Artifact, error) {
+		return models.Artifact{}, models.NewArtifactMangerError(
+			fmt.Sprintf("failed to update artifact %s content", artifact.ID), err, true,
+		)
+	}
+
+	// Prove the caller is not pointing at another workspace's staging object.
+	if err := m.verifyStagingKeyOwnership(artifact.WorkspaceID, stagingObjKey); err != nil {
+		return failure(err)
+	}
+
+	// Measure what actually landed, before any copy, so an over-cap object costs nothing and
+	// leaves the entry pointing at its existing content.
+	stagingStat, err := m.s3.GetObjectStat(ctx, m.storeConfig.Bucket, stagingObjKey)
+	if err != nil {
+		return failure(err)
+	}
+	if err := m.enforceSizeCap(
+		stagingStat.Size, fmt.Sprintf("staged object '%s'", stagingObjKey),
+	); err != nil {
+		return failure(err)
+	}
+
+	// Re-sniffed rather than carried over from the entry: the new content is new content, and
+	// may well be of a different type than what the artifact held before.
+	mimeType, err := m.sniffObjectMIMEType(ctx, stagingObjKey)
+	if err != nil {
+		return failure(err)
+	}
+
+	// A NEW key every time. Copying over the existing object would make the update
+	// non-atomic, and a same-key copy is its own hazard in an S3-compatible store (see
+	// DESIGN §6.2).
+	storeObjKey := m.newStoreObjectKey(artifact.WorkspaceID)
+
+	if err := m.s3.CopyObject(
+		ctx, m.storeConfig.Bucket, stagingObjKey, m.storeConfig.Bucket, storeObjKey, &mimeType,
+	); err != nil {
+		return failure(err)
+	}
+
+	var updated models.Artifact
+	if err := db.ActiveSessionWrapper(
+		ctx, activeSession, m.persistence, func(dbCtx context.Context, dbClient db.Database) error {
+			if err := dbClient.UpdateArtifactObject(
+				dbCtx, artifact.ID, storeObjKey, mimeType, stagingStat.Size,
+			); err != nil {
+				return goutils.NewPersistenceError(
+					fmt.Sprintf("failed to repoint artifact %s at its new object", artifact.ID),
+					err,
+					true,
+				)
+			}
+			// Re-read within the same transaction so the returned entry reflects the update.
+			var err error
+			updated, err = dbClient.GetArtifact(dbCtx, artifact.ID)
+			if err != nil {
+				return goutils.NewPersistenceError(
+					fmt.Sprintf("failed to read back updated artifact %s", artifact.ID), err, true,
+				)
+			}
+			return nil
+		},
+	); err != nil {
+		return failure(err)
+	}
+
+	// Best-effort: the entry already points at the new object, so failing the call over
+	// leftover staging debris would be strictly worse than leaving it. The maintenance sweep
+	// reclaims aged staging objects (see DESIGN §8.2.1).
+	if err := m.s3.DeleteObject(ctx, m.storeConfig.Bucket, stagingObjKey); err != nil {
+		log.
+			WithError(err).
+			WithFields(logTags).
+			WithField("staging_object_key", stagingObjKey).
+			Warn("Failed to delete staging object after content update; left for reclamation")
+	}
+
+	log.
+		WithFields(logTags).
+		WithField("workspace", artifact.WorkspaceID).
+		WithField("artifact", artifact.ID).
+		WithField("old_object_key", artifact.ObjectKey).
+		WithField("object_key", storeObjKey).
+		Debug("Updated artifact content")
+
+	return updated, nil
 }

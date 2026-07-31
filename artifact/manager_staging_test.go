@@ -855,3 +855,797 @@ func TestManagerRegisterNewArtifact(t *testing.T) {
 		assert.Equal(expected, entry)
 	})
 }
+
+// ======================================================================================
+// UpdateArtifactContent
+
+// updateFixture the arrangement a successful content update needs, so each case can vary the one
+// step it is about rather than restating the whole chain.
+type updateFixture struct {
+	workspace     models.Workspace
+	artifact      models.Artifact
+	stagingObjKey string
+	content       []byte
+	mimeType      string
+	reader        *fakeObjectReader
+	mockDatabase  *mockdb.Database
+}
+
+// expectSuccessfulContentUpdate arrange the full happy-path object-store chain: stat, sniff,
+// copy, and the best-effort staging delete. `copiedKey` receives the final key the copy targeted.
+// The persistence expectations are left to the caller, since that is what most cases vary.
+func expectSuccessfulContentUpdate(
+	t *testing.T, mocks unitTestManagerMocks, copiedKey *string,
+) updateFixture {
+	fixture := updateFixture{
+		workspace: sampleWorkspace("test-workspace"),
+		content:   []byte("replacement artifact body"),
+		mimeType:  "application/json",
+	}
+	fixture.artifact = sampleArtifact(fixture.workspace, "report-txt")
+	fixture.stagingObjKey = stagingKeyFor(fixture.workspace)
+	fixture.reader = newFakeObjectReader(fixture.content)
+	fixture.mockDatabase = mockdb.NewDatabase(t)
+
+	mocks.s3.EXPECT().
+		GetObjectStat(mock.Anything, unitTestBucket, fixture.stagingObjKey).
+		Return(goutils.S3ObjectStat{Size: int64(len(fixture.content))}, nil).
+		Once()
+
+	mocks.s3.EXPECT().
+		GetObject(mock.Anything, unitTestBucket, fixture.stagingObjKey).
+		Return(goutils.S3ObjectStat{}, fixture.reader, nil).
+		Once()
+
+	mocks.callbacks.EXPECT().
+		EstimateMIMEType(mock.Anything).
+		Return(fixture.mimeType).
+		Once()
+
+	mocks.s3.EXPECT().
+		CopyObject(
+			mock.Anything,
+			unitTestBucket,
+			fixture.stagingObjKey,
+			unitTestBucket,
+			mock.Anything,
+			&fixture.mimeType,
+		).
+		Run(func(_ context.Context, _ string, _ string, _ string, dstKey string, _ *string) {
+			if copiedKey != nil {
+				*copiedKey = dstKey
+			}
+		}).
+		Return(nil).
+		Once()
+
+	mocks.s3.EXPECT().
+		DeleteObject(mock.Anything, unitTestBucket, fixture.stagingObjKey).
+		Return(nil).
+		Once()
+
+	return fixture
+}
+
+// TestManagerUpdateArtifactContent validates the update path: it repeats every pre-copy guard
+// the register path applies, always writes to a new final key, and repoints the entry without
+// creating one.
+func TestManagerUpdateArtifactContent(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+
+	t.Run("repoints the entry at a new object", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		var copiedKey string
+		fixture := expectSuccessfulContentUpdate(t, mocks, &copiedKey)
+
+		expected := fixture.artifact
+		expected.ObjectKey = "read-back-object-key"
+		expected.MIMEType = fixture.mimeType
+		expected.Size = int64(len(fixture.content))
+
+		var (
+			gotID       string
+			gotKey      string
+			gotMIMEType string
+			gotSize     int64
+		)
+		fixture.mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Run(func(_ context.Context, id string, key string, mimeType string, size int64) {
+				gotID, gotKey, gotMIMEType, gotSize = id, key, mimeType, size
+			}).
+			Return(nil).
+			Once()
+		fixture.mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, fixture.artifact.ID).
+			Return(expected, nil).
+			Once()
+
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(fixture.mockDatabase)).
+			Once()
+
+		entry, err := manager.UpdateArtifactContent(
+			context.Background(), fixture.artifact, fixture.stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+		// The returned entry is the read-back, not the caller's stale copy.
+		assert.Equal(expected, entry)
+
+		// The entry is repointed at the object that was actually copied, described by what was
+		// measured and sniffed server-side - not by anything the caller asserted.
+		assert.Equal(fixture.artifact.ID, gotID)
+		assert.Equal(copiedKey, gotKey)
+		assert.Equal(fixture.mimeType, gotMIMEType)
+		assert.Equal(int64(len(fixture.content)), gotSize)
+	})
+
+	t.Run("always writes to a new final key", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		var copiedKey string
+		fixture := expectSuccessfulContentUpdate(t, mocks, &copiedKey)
+
+		fixture.mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		fixture.mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, mock.Anything).
+			Return(fixture.artifact, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(fixture.mockDatabase)).
+			Once()
+
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), fixture.artifact, fixture.stagingObjKey, nil,
+		)
+		assert.Nil(err)
+
+		// Never over the object the entry already points at: an in-place overwrite would make
+		// the update non-atomic, and a same-key copy is its own hazard (see DESIGN §6.2, §6.3).
+		assert.NotEqual(fixture.artifact.ObjectKey, copiedKey)
+		assert.NotEqual(fixture.stagingObjKey, copiedKey)
+		assert.True(
+			strings.HasPrefix(
+				copiedKey, fmt.Sprintf("%s/%s/", unitTestStorePrefix, fixture.workspace.ID),
+			),
+			"final key '%s' must be scoped to workspace %s", copiedKey, fixture.workspace.ID,
+		)
+	})
+
+	t.Run("never deletes the object the entry previously held", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		var copiedKey string
+		fixture := expectSuccessfulContentUpdate(t, mocks, &copiedKey)
+
+		fixture.mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		fixture.mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, mock.Anything).
+			Return(fixture.artifact, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(fixture.mockDatabase)).
+			Once()
+
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), fixture.artifact, fixture.stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+		// The only DeleteObject arranged by the fixture is the staging cleanup. The old final
+		// object is orphaned by design and left for the object-reaping GC; deleting it here
+		// would place a second reclaimer alongside the GC (see DESIGN §6.3, §8.2.1).
+		mocks.s3.AssertNotCalled(
+			t, "DeleteObject", mock.Anything, unitTestBucket, fixture.artifact.ObjectKey,
+		)
+	})
+
+	t.Run("re-sniffs rather than reusing the entry's MIME type", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		// The entry currently holds text; the replacement bytes are something else entirely.
+		entry := sampleArtifact(workspace, "was-text")
+		stagingObjKey := stagingKeyFor(workspace)
+		newMIMEType := "image/png"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 32}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("\x89PNG\r\n\x1a\n")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(newMIMEType).
+			Once()
+
+		// The copy carries the newly sniffed type, so the stored object's Content-Type tracks
+		// its actual content rather than what the artifact used to hold.
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				&newMIMEType,
+			).
+			Return(nil).
+			Once()
+		mocks.s3.EXPECT().
+			DeleteObject(mock.Anything, mock.Anything, mock.Anything).
+			Return(nil).
+			Once()
+
+		var recordedMIMEType string
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Run(func(_ context.Context, _ string, _ string, mimeType string, _ int64) {
+				recordedMIMEType = mimeType
+			}).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, mock.Anything).
+			Return(entry, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+		assert.Equal(newMIMEType, recordedMIMEType)
+		assert.NotEqual(entry.MIMEType, recordedMIMEType)
+	})
+
+	t.Run("updates a MISSING_OBJECT artifact without a state gate", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		var copiedKey string
+		fixture := expectSuccessfulContentUpdate(t, mocks, &copiedKey)
+
+		// Re-uploading the bytes is exactly how a quarantined artifact is brought back into
+		// service, so the manager must not refuse one (unlike GenerateGetURLForArtifact, which
+		// must). The transition itself is the persistence layer's to validate.
+		quarantined := fixture.artifact
+		quarantined.State = models.ArtifactStateMissingObject
+
+		restored := quarantined
+		restored.State = models.ArtifactStateRecorded
+
+		fixture.mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		fixture.mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, quarantined.ID).
+			Return(restored, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(fixture.mockDatabase)).
+			Once()
+
+		entry, err := manager.UpdateArtifactContent(
+			context.Background(), quarantined, fixture.stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+		assert.Equal(models.ArtifactStateRecorded, entry.State)
+	})
+
+	t.Run("updates within an active session", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		var copiedKey string
+		fixture := expectSuccessfulContentUpdate(t, mocks, &copiedKey)
+
+		activeSession := mockdb.NewDatabase(t)
+		activeSession.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		activeSession.EXPECT().
+			GetArtifact(mock.Anything, fixture.artifact.ID).
+			Return(fixture.artifact, nil).
+			Once()
+
+		// No UseDatabaseInTransaction expectation: with an active session the manager must
+		// reuse the caller's transaction rather than opening its own, so the update and its
+		// read-back stay inside the caller's unit of work.
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), fixture.artifact, fixture.stagingObjKey, activeSession,
+		)
+
+		assert.Nil(err)
+	})
+
+	t.Run("sniffs only the leading bytes and closes the body", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "big-blob")
+		stagingObjKey := stagingKeyFor(workspace)
+		// Larger than the detection window, so a full read would be observable.
+		content := bytes.Repeat([]byte("y"), int(unitTestMaxObjectSize))
+		reader := newFakeObjectReader(content)
+		mimeType := "application/octet-stream"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: int64(len(content))}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, reader, nil).
+			Once()
+
+		var sniffed []byte
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Run(func(data []byte) { sniffed = data }).
+			Return(mimeType).
+			Once()
+
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mocks.s3.EXPECT().
+			DeleteObject(mock.Anything, mock.Anything, mock.Anything).
+			Return(nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, mock.Anything).
+			Return(entry, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+
+		// The read is bounded at the detection window on this path too, so the rest of a large
+		// replacement object never transits just to identify its type.
+		assert.Len(sniffed, 3072)
+		assert.Less(len(sniffed), len(content))
+		assert.True(reader.closed, "the object body must be closed after the sniff")
+	})
+
+	t.Run("rejects a staging key issued for another workspace", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, _ := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		foreign := stagingKeyFor(sampleWorkspace("other-workspace"))
+
+		// No object store or DB expectations: the ownership guard applies to the update path
+		// exactly as it does to register, so a key aimed at another workspace never reads its
+		// object and never reaches the entry (see DESIGN §6.3).
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, foreign, nil,
+		)
+
+		assertBadInputError(assert, err)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("rejects a key merely prefixed by the workspace ID", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, _ := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		// A sibling workspace whose ID starts with this one's would otherwise slip through a
+		// separator-less prefix match.
+		lookalike := fmt.Sprintf(
+			"%s/%s-evil/%s", unitTestStagingPrefix, workspace.ID, ulid.Make().String(),
+		)
+
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, lookalike, nil,
+		)
+
+		assertBadInputError(assert, err)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("rejects a staged object over the cap before copying", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: unitTestMaxObjectSize + 1}, nil).
+			Once()
+
+		// No CopyObject or UpdateArtifactObject expectation - neither may run. Rejecting before
+		// the copy is what leaves the entry pointing at its existing content (see DESIGN §7.5).
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertBadInputError(assert, err)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("accepts a staged object exactly at the cap", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "at-cap")
+		stagingObjKey := stagingKeyFor(workspace)
+		mimeType := "application/octet-stream"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: unitTestMaxObjectSize}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("at cap")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mocks.s3.EXPECT().
+			DeleteObject(mock.Anything, mock.Anything, mock.Anything).
+			Return(nil).
+			Once()
+
+		var recordedSize int64
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Run(func(_ context.Context, _ string, _ string, _ string, size int64) {
+				recordedSize = size
+			}).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, mock.Anything).
+			Return(entry, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		// The cap is inclusive - an object of exactly the maximum size is still a single PUT.
+		_, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assert.Nil(err)
+		assert.Equal(unitTestMaxObjectSize, recordedSize)
+	})
+
+	t.Run("surfaces a stat failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+		storeErr := fmt.Errorf("no such staged object")
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, storeErr).
+			Once()
+
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertManagerError(assert, err, storeErr)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("surfaces a sniff read failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+		storeErr := fmt.Errorf("object body unreadable")
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 16}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, nil, storeErr).
+			Once()
+
+		// No CopyObject expectation: an unsniffable object must not be promoted, since the
+		// MIME type is written onto the copy.
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertManagerError(assert, err, storeErr)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("surfaces a copy failure without touching the entry", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+		storeErr := fmt.Errorf("copy rejected")
+		mimeType := "text/plain; charset=utf-8"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(storeErr).
+			Once()
+
+		// No UpdateArtifactObject expectation: repointing after a failed copy would leave the
+		// entry aimed at nothing, which the ordering exists to prevent (see DESIGN §6.3).
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertManagerError(assert, err, storeErr)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("surfaces an update failure and leaves the staging object", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+		dbErr := fmt.Errorf("artifact can't transition to 'RECORDED'")
+		mimeType := "text/plain; charset=utf-8"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(dbErr).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		// No GetArtifact expectation: the read-back is reached only after a successful update.
+		// No DeleteObject expectation either, so both objects are left for the maintenance sweep.
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertManagerError(assert, err, dbErr)
+
+		var persistenceErr goutils.PersistenceError
+		assert.True(
+			errors.As(err, &persistenceErr), "expected PersistenceError, got %T: %v", err, err,
+		)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("surfaces a read back failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "target")
+		stagingObjKey := stagingKeyFor(workspace)
+		dbErr := fmt.Errorf("artifact vanished")
+		mimeType := "text/plain; charset=utf-8"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, entry.ID).
+			Return(models.Artifact{}, dbErr).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		// The read-back is inside the transaction, so its failure fails the whole call rather
+		// than returning a half-known entry.
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		assertManagerError(assert, err, dbErr)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
+	t.Run("succeeds despite a failed staging cleanup", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "kept")
+		stagingObjKey := stagingKeyFor(workspace)
+		mimeType := "text/plain; charset=utf-8"
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mocks.s3.EXPECT().
+			DeleteObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(fmt.Errorf("staging delete rejected")).
+			Once()
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, entry.ID).
+			Return(entry, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		// The entry already points at the new object by this point, so failing the call over
+		// leftover staging debris would be strictly worse than leaving it (see DESIGN §8.2.1).
+		assert.Nil(err)
+		assert.Equal(entry, updated)
+	})
+}

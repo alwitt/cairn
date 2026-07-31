@@ -116,6 +116,49 @@ type Manager interface {
 	) (models.Artifact, error)
 
 	/*
+		UpdateArtifactContent replace an existing artifact's content with a newly staged object.
+
+		This is `RegisterNewArtifact` minus the insert: the artifact entry already exists, so the
+		function only needs to determine the newly staged object's size and MIME type, copy it
+		into a new final storage object key, and repoint the entry at it (see DESIGN §6.3).
+
+		Every pre-copy check `RegisterNewArtifact` performs applies here unchanged - the staging
+		object key is verified as belonging to this artifact's workspace, and the object's
+		measured size is checked against the single-PUT size cap before anything is copied, so an
+		over-cap object never reaches the entry (see DESIGN §7.5).
+
+		The content is always copied to a NEW final object key rather than over the existing one.
+		The entry is then flipped to the new key in a single update, so a reader never observes it
+		pointing at a half-written object. The old object is left behind by design; the
+		object-reaping GC reclaims it as an aged final object with no backing row (see DESIGN
+		§6.2, §6.3, §8.2.1).
+
+		Concurrent updates are last-writer-wins. Each writer copies to its own new key, and the
+		final entry update decides the winner; the loser's object is reclaimed the same way. There
+		is no optimistic locking (see DESIGN §7.5.2).
+
+		An artifact quarantined as `MISSING_OBJECT` is a legitimate target: re-uploading its bytes
+		is exactly how it is brought back into service. The state transition is validated by the
+		persistence layer, so no state gate is applied here.
+
+			@param ctx context.Context - execution context
+			@param artifact models.Artifact - the artifact to update
+			@param stagingObjKey string - the staging object returned by `GetArtifactStagingPutURL`.
+			    The system expects the artifact entry's new data file is stored at this location
+			    already.
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+			@returns the updated artifact entry
+	*/
+	UpdateArtifactContent(
+		ctx context.Context,
+		artifact models.Artifact,
+		stagingObjKey string,
+		activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
 		ListWorkspaceArtifacts list artifacts in a particular workspace
 
 		The filter's state selection is a listing option rather than a hardcoded filter: leaving it
@@ -190,6 +233,63 @@ type Manager interface {
 	GenerateGetURLForArtifact(
 		ctx context.Context, artifact models.Artifact, ttl time.Duration,
 	) (string, error)
+
+	/*
+		RenameArtifact change an artifact's name.
+
+		A pure DB update - the backing object key carries a random suffix rather than the name, so
+		a rename never touches the object store (see DESIGN §2.2).
+
+		Names are unique within the parent workspace, and that constraint is the real guard: a
+		collision surfaces as a persistence failure rather than being pre-checked here.
+
+			@param ctx context.Context - execution context
+			@param artifactID string - ID of artifact to rename
+			@param newName string - the new artifact name
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+			@returns the artifact entry with an updated name
+	*/
+	RenameArtifact(
+		ctx context.Context, artifactID string, newName string, activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
+		UpdateArtifactDescription change an artifact's description
+
+			@param ctx context.Context - execution context
+			@param artifactID string - ID of artifact to update
+			@param newDescription *string - the new description, nil to clear it
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+			@returns the artifact entry with an updated description
+	*/
+	UpdateArtifactDescription(
+		ctx context.Context,
+		artifactID string,
+		newDescription *string,
+		activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
+		DeleteArtifact delete an artifact entry.
+
+		Idempotent - deleting an absent entry is a no-op.
+
+		No object-store interaction: the object the entry referenced is left in the store and
+		reclaimed later by the object-reaping GC. Deleting it here would place a second reclaimer
+		alongside the GC, and the DB is what is authoritative for what exists (see DESIGN §2.2.1,
+		§4.1, §8.2.1).
+
+			@param ctx context.Context - execution context
+			@param artifactID string - ID of artifact to delete
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+	*/
+	DeleteArtifact(ctx context.Context, artifactID string, activeSession db.Database) error
 }
 
 /*
@@ -345,15 +445,13 @@ func (m *managerImpl) newStoreObjectKey(workspaceID string) string {
 // Staging keys are server-generated and workspace-scoped by construction (see DESIGN §8.1),
 // so a prefix match proves the key was minted for this workspace and rejects one aimed at
 // another (see DESIGN §6.1 step 2.1).
-func (m *managerImpl) verifyStagingKeyOwnership(
-	workspace models.Workspace, stagingObjKey string,
-) error {
-	prefix := m.storeConfig.Prefix.StagingKeyPrefix(workspace.ID) + "/"
+func (m *managerImpl) verifyStagingKeyOwnership(workspaceID string, stagingObjKey string) error {
+	prefix := m.storeConfig.Prefix.StagingKeyPrefix(workspaceID) + "/"
 	if !strings.HasPrefix(stagingObjKey, prefix) {
 		return goutils.NewBadInputError(
 			fmt.Sprintf(
 				"staging object key '%s' was not issued for workspace %s",
-				stagingObjKey, workspace.ID,
+				stagingObjKey, workspaceID,
 			), nil, true,
 		)
 	}
