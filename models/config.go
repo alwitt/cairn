@@ -1,6 +1,11 @@
 package models
 
-import "github.com/alwitt/goutils"
+import (
+	"path/filepath"
+	"time"
+
+	"github.com/alwitt/goutils"
+)
 
 // ======================================================================================
 // HTTP
@@ -102,6 +107,86 @@ type WorkspaceManagerConfig struct {
 }
 
 // ======================================================================================
+// Artifact Config
+
+// ObjectStoreConfig object store config
+type ObjectStoreConfig struct {
+	// ServerEndpoint S3 server endpoint
+	ServerEndpoint string `mapstructure:"endpoint" json:"endpoint" validate:"required"`
+	// UseTLS whether to TLS when connecting
+	UseTLS bool `mapstructure:"useTLS" json:"useTLS"`
+	// AccessKey object store access key
+	AccessKey string `mapstructure:"accessID" json:"accessID" validate:"required"`
+	// SecretAccessKey object store secret access key
+	SecretAccessKey string `mapstructure:"secretID" json:"secretID" validate:"required"`
+}
+
+// ArtifactKeyConfig artifact object key configs
+type ArtifactKeyConfig struct {
+	// BasePrefix optional prefix to append to all object keys
+	BasePrefix *string `mapstructure:"base,omitempty" json:"base,omitempty" validate:"-"`
+	// StagingPrefix prefix to append to a workspace's staging object keys
+	StagingPrefix string `mapstructure:"staging" json:"staging" validate:"required"`
+	// StorePrefix prefix to append to a workspace's storage object keys
+	StorePrefix string `mapstructure:"store" json:"store" validate:"required"`
+}
+
+// StagingKeyPrefix helper function to construct the artifact staging object key prefix
+// for a particular workspace
+func (c ArtifactKeyConfig) StagingKeyPrefix(workspaceID string) string {
+	pieces := []string{}
+	if c.BasePrefix != nil {
+		pieces = append(pieces, *c.BasePrefix)
+	}
+	pieces = append(pieces, c.StagingPrefix)
+	pieces = append(pieces, workspaceID)
+	return filepath.Join(pieces...)
+}
+
+// StoreKeyPrefix helper function to construct the artifact storage object key prefix
+// for a particular workspace
+func (c ArtifactKeyConfig) StoreKeyPrefix(workspaceID string) string {
+	pieces := []string{}
+	if c.BasePrefix != nil {
+		pieces = append(pieces, *c.BasePrefix)
+	}
+	pieces = append(pieces, c.StorePrefix)
+	pieces = append(pieces, workspaceID)
+	return filepath.Join(pieces...)
+}
+
+// ArtifactStorageConfig artifact storage config
+type ArtifactStorageConfig struct {
+	// Bucket to store all artifact and staging objects in
+	Bucket string `mapstructure:"bucket" json:"bucket" validate:"required"`
+
+	// UploadPutURLTTLSec number of seconds a artifact staging PUT URL is valid for
+	UploadPutURLTTLSec int `mapstructure:"putUrlTTL" json:"putUrlTTL" validate:"required,gte=5"`
+
+	// MaxObjectSizeBytes the single-PUT size cap for an artifact's backing object.
+	// Multipart upload is out of scope for the first cut, so an object larger than this is
+	// an error rather than something to engineer around (see DESIGN §5.2).
+	MaxObjectSizeBytes int64 `mapstructure:"maxObjectSize" json:"maxObjectSize" validate:"required,gt=0"`
+
+	// Prefix object key prefix config
+	Prefix ArtifactKeyConfig `mapstructure:"prefix" json:"prefix" validate:"required"`
+}
+
+// UploadPutURLTTL convert UploadPutUrlTTLSec to time.Duration
+func (c ArtifactStorageConfig) UploadPutURLTTL() time.Duration {
+	return time.Second * time.Duration(c.UploadPutURLTTLSec)
+}
+
+// ArtifactManagerConfig artifact manager config
+type ArtifactManagerConfig struct {
+	// ObjectStore object store config
+	ObjectStore ObjectStoreConfig `mapstructure:"s3" json:"s3" validate:"required"`
+
+	// Storage artifact storage config
+	Storage ArtifactStorageConfig `mapstructure:"store" json:"store" validate:"required"`
+}
+
+// ======================================================================================
 // Application Config
 
 // ApplicationConfig application config
@@ -117,4 +202,7 @@ type ApplicationConfig struct {
 
 	// Workspace manager configuration
 	Workspace WorkspaceManagerConfig `mapstructure:"workspace" json:"workspace" validate:"required"`
+
+	// Artifact artifact configuration
+	Artifact ArtifactManagerConfig `mapstructure:"artifact" json:"artifact" validate:"required"`
 }
