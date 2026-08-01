@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.prep
+test-reports/
+
+# Poetry virtualenv (if created in-project)
+.venv/

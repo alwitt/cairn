@@ -1,0 +1,38 @@
+[project]
+name = "cairn-sidecar"
+version = "0.1.0"
+description = "Support code executed inside cairn's short-lived transfer and stat/hash sidecar containers."
+authors = [
+    {name = "Rhine Cliff"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click (>=8.0,<9.0)",
+    "requests (>=2.31,<3.0)"
+]
+
+[tool.poetry]
+packages = [{include = "cairn_sidecar", from = "./"}]
+
+
+[tool.poetry.group.dev.dependencies]
+isort = "^7.0.0"
+pylint = "^4.0.4"
+pytest = "^9.0.1"
+ruff = "^0.14.7"
+mypy = "^1.19.0"
+types-requests = "^2.31"
+
+
+[tool.poetry.scripts]
+cairn-stat = 'cairn_sidecar.cli:stat_command'
+cairn-upload = 'cairn_sidecar.cli:upload_command'
+cairn-download = 'cairn_sidecar.cli:download_command'
+
+[tool.mypy]
+python_version = "3.12"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
