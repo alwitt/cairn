@@ -177,6 +177,64 @@ func (c ArtifactStorageConfig) UploadPutURLTTL() time.Duration {
 	return time.Second * time.Duration(c.UploadPutURLTTLSec)
 }
 
+// ArtifactSidecarExtraEnvVar extra ENV variable to add to a sidecar
+type ArtifactSidecarExtraEnvVar struct {
+	// Name ENV variable name
+	Name string `mapstructure:"name" json:"name" validate:"required"`
+	// Value ENV variable value
+	Value string `mapstructure:"value" json:"value" validate:"required"`
+}
+
+// ArtifactSidecarExtraHost extra host-to-IP mapping to inject into the container's /etc/hosts
+type ArtifactSidecarExtraHost struct {
+	// Host hostname to map to the IP address
+	Host string `mapstructure:"host" json:"host" validate:"required"`
+	// Address the IP address the hostname resolved to
+	Address string `mapstructure:"address" json:"address" validate:"required,ip"`
+}
+
+// DefaultSidecarNetworkMode the network mode a transfer sidecar runs with when the config
+// does not name one.
+//
+// Deliberately not the container runtime's own default: that is `none` (see goutils
+// `runtime.DefaultDockerNetworkMode`), which suits the stat sidecar but would leave a
+// transfer sidecar unable to reach the object store at all.
+const DefaultSidecarNetworkMode = "bridge"
+
+// ArtifactSidecarConfig artifact operations sidecar config
+type ArtifactSidecarConfig struct {
+	// Image the sidecar container image artifact operations run
+	Image string `mapstructure:"image" json:"image" validate:"required"`
+
+	// TimeoutSecs wall-clock timeout for a single sidecar run
+	TimeoutSecs int `mapstructure:"timeoutSecs" json:"timeoutSecs" validate:"required,gt=0"`
+
+	// NetworkMode the container network a transfer sidecar reaches the object store on.
+	// Defaults to DefaultSidecarNetworkMode when unset. The stat sidecar ignores this and
+	// always runs with no network at all (see DESIGN §5.1).
+	NetworkMode string `mapstructure:"networkMode,omitempty" json:"networkMode,omitempty"`
+
+	// ExtraEnvs extra ENV variables to launch the sidecar containers with
+	ExtraEnvs []ArtifactSidecarExtraEnvVar `mapstructure:"envs,omitempty" json:"envs,omitempty" validate:"omitempty,dive"`
+
+	// ExtraHosts extra host-to-IP mapping to inject into sidecar containers
+	ExtaHosts []ArtifactSidecarExtraHost `mapstructure:"hosts,omitempty" json:"hosts,omitempty" validate:"omitempty,dive"`
+}
+
+// TransferNetworkMode resolve the network mode a transfer sidecar runs with, defaulting when
+// the config does not name one.
+func (c ArtifactSidecarConfig) TransferNetworkMode() string {
+	if c.NetworkMode == "" {
+		return DefaultSidecarNetworkMode
+	}
+	return c.NetworkMode
+}
+
+// SidecarTimeout convert TimeoutSecs to time.Duration
+func (c ArtifactSidecarConfig) SidecarTimeout() time.Duration {
+	return time.Second * time.Duration(c.TimeoutSecs)
+}
+
 // ArtifactManagerConfig artifact manager config
 type ArtifactManagerConfig struct {
 	// ObjectStore object store config
@@ -184,6 +242,9 @@ type ArtifactManagerConfig struct {
 
 	// Storage artifact storage config
 	Storage ArtifactStorageConfig `mapstructure:"store" json:"store" validate:"required"`
+
+	// Sidecar artifact operations sidecar config
+	Sidecar ArtifactSidecarConfig `mapstructure:"sidecar" json:"sidecar" validate:"required"`
 }
 
 // ======================================================================================

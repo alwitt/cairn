@@ -5,6 +5,9 @@
 package mocktest
 
 import (
+	"context"
+
+	"github.com/alwitt/goutils/runtime"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -33,6 +36,92 @@ type UnitTestCallbackCollector_Expecter struct {
 
 func (_m *UnitTestCallbackCollector) EXPECT() *UnitTestCallbackCollector_Expecter {
 	return &UnitTestCallbackCollector_Expecter{mock: &_m.Mock}
+}
+
+// DefineSystemCallDockerRuntime provides a mock function for the type UnitTestCallbackCollector
+func (_mock *UnitTestCallbackCollector) DefineSystemCallDockerRuntime(ctx context.Context, name string, command runtime.ContainerCommand, params runtime.DockerRuntimeParams, clearANSIFromOutput bool) (runtime.SystemCallRuntime, error) {
+	ret := _mock.Called(ctx, name, command, params, clearANSIFromOutput)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DefineSystemCallDockerRuntime")
+	}
+
+	var r0 runtime.SystemCallRuntime
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, runtime.ContainerCommand, runtime.DockerRuntimeParams, bool) (runtime.SystemCallRuntime, error)); ok {
+		return returnFunc(ctx, name, command, params, clearANSIFromOutput)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, runtime.ContainerCommand, runtime.DockerRuntimeParams, bool) runtime.SystemCallRuntime); ok {
+		r0 = returnFunc(ctx, name, command, params, clearANSIFromOutput)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(runtime.SystemCallRuntime)
+		}
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, runtime.ContainerCommand, runtime.DockerRuntimeParams, bool) error); ok {
+		r1 = returnFunc(ctx, name, command, params, clearANSIFromOutput)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DefineSystemCallDockerRuntime'
+type UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call struct {
+	*mock.Call
+}
+
+// DefineSystemCallDockerRuntime is a helper method to define mock.On call
+//   - ctx context.Context
+//   - name string
+//   - command runtime.ContainerCommand
+//   - params runtime.DockerRuntimeParams
+//   - clearANSIFromOutput bool
+func (_e *UnitTestCallbackCollector_Expecter) DefineSystemCallDockerRuntime(ctx interface{}, name interface{}, command interface{}, params interface{}, clearANSIFromOutput interface{}) *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call {
+	return &UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call{Call: _e.mock.On("DefineSystemCallDockerRuntime", ctx, name, command, params, clearANSIFromOutput)}
+}
+
+func (_c *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call) Run(run func(ctx context.Context, name string, command runtime.ContainerCommand, params runtime.DockerRuntimeParams, clearANSIFromOutput bool)) *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 runtime.ContainerCommand
+		if args[2] != nil {
+			arg2 = args[2].(runtime.ContainerCommand)
+		}
+		var arg3 runtime.DockerRuntimeParams
+		if args[3] != nil {
+			arg3 = args[3].(runtime.DockerRuntimeParams)
+		}
+		var arg4 bool
+		if args[4] != nil {
+			arg4 = args[4].(bool)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+		)
+	})
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call) Return(systemCallRuntime runtime.SystemCallRuntime, err error) *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call {
+	_c.Call.Return(systemCallRuntime, err)
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call) RunAndReturn(run func(ctx context.Context, name string, command runtime.ContainerCommand, params runtime.DockerRuntimeParams, clearANSIFromOutput bool) (runtime.SystemCallRuntime, error)) *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call {
+	_c.Call.Return(run)
+	return _c
 }
 
 // EstimateMIMEType provides a mock function for the type UnitTestCallbackCollector

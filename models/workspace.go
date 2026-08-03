@@ -28,6 +28,17 @@ func (WorkspaceVolumeStateENUM) Values() []WorkspaceVolumeStateENUM {
 	}
 }
 
+// WorkspaceMountPath the canonical path every container mounts a workspace volume at.
+//
+// Artifact paths only round-trip if every container agrees on it - the tool container where
+// the agent's tool writes a file, and cairn's own sidecars that read it back. A file written
+// at this path must be visible to the upload sidecar at the same path, or no artifact
+// operation works.
+//
+// A named constant rather than scattered literals, so it can become configurable later; it is
+// fixed for the first cut (see DESIGN §4.4).
+const WorkspaceMountPath = "/mnt/cairn/ws"
+
 // WorkspaceVolumeTypeENUM workspace persistence volume type
 type WorkspaceVolumeTypeENUM string
 

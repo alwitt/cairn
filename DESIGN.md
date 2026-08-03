@@ -294,8 +294,11 @@ sidecar at that exact path, or no artifact operation works.
 
 - **The mount path is a fixed constant: `/mnt/cairn/ws`.** It is **not** a data-model
   field and **not** per-workspace — it is one service-wide value used by clients and
-  sidecars alike. (Kept a named constant, not scattered literals, so it *can* become
-  configurable later; fixed for the first cut.)
+  sidecars alike. Realized as `models.WorkspaceMountPath`, a single named constant
+  rather than scattered literals, so it *can* become configurable later; fixed for the
+  first cut. The sidecars themselves hold **no** copy of it: the service passes it in
+  as `CAIRN_MOUNT_ROOT` (§5.3), so making it configurable would never require
+  rebuilding the sidecar image.
 - **One workspace per containerized tool call.** Because the mount path is a single
   fixed location, at most one workspace volume can be mounted into a given container.
   This is an accepted, explicit constraint — multi-workspace mounting would require a
@@ -320,8 +323,8 @@ container).
 | Container | Network | Credentials | Runs agent-influenced code |
 |---|---|---|---|
 | **Tool container** (in `multitool`) | none | none | yes |
-| **Stat/hash sidecar** (volume-based upload/update only) | **none** | **none** | no — fixed command; resolves + validates a volume source file, emits a `{resolved_path, valid, size, sha256}` stat block on stdout (§6.4, §7.5.3) |
-| **Transfer sidecar** | reaches the **object store** (via its presigned URL); does **not** call back into the service | **none** (uses presigned URLs) | no — fixed `curl` over server-provided URLs |
+| **Stat/hash sidecar** (volume-based upload/update only) | **none** | **none** | no — fixed command (`cairn-stat`); resolves + validates a volume source file, emits a `{resolved_path, valid, size, sha256_b64}` stat block as a framed result line (§5.3, §6.4, §7.5.3) |
+| **Transfer sidecar** | reaches the **object store** (via its presigned URL); does **not** call back into the service | **none** (uses presigned URLs) | no — fixed command (`cairn-upload` / `cairn-download`) over server-provided URLs |
 | **Service process** | yes | **yes** (sole credential holder) | no |
 
 The **stat/hash sidecar** exists only on the MCP upload/update path: a presigned
@@ -329,10 +332,17 @@ PUT URL is bound to an exact `Content-Length` + SHA-256 (§6.4), and the bytes l
 in the volume, reachable only from a sidecar — so their size and hash must be
 computed in a sidecar *before* the PUT URL can be minted. It needs **no network at
 all** (it neither reaches the object store nor calls back into the service — it
-only writes stdout, which the service reads via `ContainerWait`, §7.3). Like the
-transfer sidecar it runs a **fixed command over a server-supplied path**, not
-agent-supplied code, which is what keeps it in the "no agent-influenced code"
+only writes its result line, which the service reads after `ContainerWait`, §7.3).
+Like the transfer sidecar it runs a **fixed command over a server-supplied path**,
+not agent-supplied code, which is what keeps it in the "no agent-influenced code"
 tier.
+
+> **Network mode is explicit, not defaulted.** The container runtime defaults an
+> unspecified network to `none`, which is exactly right for the stat/hash sidecar
+> but would leave a transfer sidecar unable to reach the object store at all. So
+> the transfer sidecars are launched with a **routable** network mode
+> (`artifact.sidecar.networkMode`, defaulting to `bridge`), and the stat sidecar
+> is left at `none`.
 
 ### 5.2 Presigned URLs eliminate in-sandbox credentials
 The service holds object-store credentials and mints **short-lived, key- and
@@ -342,9 +352,18 @@ token, no durable secret. Enforcement of *which key/operation* lives in the
 
 Disciplines:
 - URL passed to the sidecar via **env var, not argv** (keep it out of
-  `/proc/<pid>/cmdline`).
-- **Redact URLs from logs** (signature is in the query string).
-- **Short TTL**, matched to the transfer.
+  `/proc/<pid>/cmdline`). Generalized in practice: sidecars take **no argv at all**
+  (§5.3).
+- **Redact URLs from logs** (signature is in the query string). This extends to
+  anything the service quotes back to a caller: when a sidecar dies without emitting
+  a result line, its raw output is the only diagnostic evidence and *is* surfaced —
+  but a crashing sidecar may have echoed its own URL into a traceback, so the
+  service **redacts the URLs it launched the container with** before quoting. The
+  redaction works from the env it supplied rather than by pattern-matching, so it
+  removes exactly the secrets it handed out.
+- **Short TTL**, matched to the transfer. In practice the sidecar's own run timeout
+  plus a small margin for container startup — the URL only has to outlive the
+  transfer it was minted for.
 - **Single-PUT size cap** for the first cut (multipart deferred). "Too big" is an
   error, not something to engineer around.
 
@@ -354,6 +373,67 @@ Disciplines:
 > *enforcement* of this (locking a sidecar down to object-store-only egress) is
 > **not implemented in the first pass** — it is an OPS/deployment concern, not an
 > in-service guarantee.
+
+### 5.3 Sidecar interface: env in, one JSON line out
+
+All three sidecars ship as **one image** (`cairn-sidecar`, a Python project under
+`sidecar/`) exposing three console entrypoints — `cairn-stat`, `cairn-upload`,
+`cairn-download`. One image rather than three keeps a single thing to build, scan,
+and pin.
+
+**Input: environment variables only.** No sidecar takes an argument or an option.
+This started as §5.2's URL-via-env rule and is applied to the *whole* input surface:
+with no argv there is nothing for an agent-influenced value to reach, and the
+container's command is a bare entrypoint name.
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `CAIRN_MOUNT_ROOT` | all | Volume mount path, supplied by the service (§4.4). Absolute. |
+| `CAIRN_SOURCE_PATH` | stat, upload | Source file inside the mount. |
+| `CAIRN_TARGET_PATH` | download | Destination file inside the mount. |
+| `CAIRN_URL` | upload, download | Presigned URL. Never logged. |
+| `CAIRN_OBJECT_SIZE` | upload | Exact byte size, sent as `Content-Length`. |
+| `CAIRN_SHA256_B64` | upload | Base64 SHA-256, sent as `x-amz-checksum-sha256`. |
+| `CAIRN_CONTENT_TYPE` | upload | Optional; sent only when the service signed one. |
+
+Note the **mount path is an input**, not compiled into the image — so §4.4 becoming
+configurable later never requires rebuilding the sidecar.
+
+**Output: one framed JSON line.** The container runtime allocates a **TTY**, so
+stdout and stderr are merged into a single stream before the service sees them
+(`SystemCallResp.Output` is that combined text). There is no stdout to parse in
+isolation, which rules out a "the JSON is on stdout" contract — one warning line
+from a library and a whole-output parse fails.
+
+So each command writes **exactly one line** of compact JSON, with a blank line
+either side, and the service scans the combined output line by line and decodes the
+line that parses. Interleaved noise is then harmless rather than fatal. Details that
+are load-bearing:
+
+- The **last** decodable JSON *object* wins, not the first — a dependency that
+  happens to log JSON must not pre-empt the real record, and the result is always
+  emitted last.
+- A line that is valid JSON but not an object (`3`, `"done"`) is **skipped**, not
+  accepted.
+- **No parseable line is a failure regardless of exit code.** It means a broken
+  image or a crash before emit; a zero exit code does not make the work have
+  happened. The error quotes the sidecar's raw output (bounded, and redacted per
+  §5.2) because that is the only evidence of what went wrong.
+- Every run emits a line on **failure too**, carrying an `"error"` string, so the
+  service reports *why* rather than surfacing a bare exit code. Where both exist, the
+  sidecar's message is preferred — "destination directory does not exist" is
+  actionable where "exit status 1" is not.
+- **The verdict field differs by sidecar, deliberately.** A transfer sidecar reports
+  `"ok"`; the stat sidecar reports `"valid"`, because "this file cannot be uploaded"
+  is an *answer* the service acts on (it rejects before minting anything, §6.4), not
+  a failed run. The service decodes each into its own shape, so the two never have to
+  be reconciled into one envelope.
+
+**Why Python and not `curl`.** A presigned PUT signs `Content-Length` **and**
+`x-amz-checksum-sha256` (and `Content-Type` when the service fixed one) into the
+URL, and the client must send every signed header with exactly the signed value.
+`curl -T` sends no checksum header at all, so it cannot satisfy the signature — the
+header set has to be explicit, which is what the upload sidecar does.
 
 ---
 
@@ -441,27 +521,40 @@ sidecar, and the presigned staging PUT URL must be bound to the exact size + has
 **stat/hash sidecar** and otherwise reuses the existing staging + register/update
 core path unchanged:
 
-1. **Stat/hash sidecar** — mounts the volume, runs a fixed command over the
-   agent-supplied source path `/mnt/cairn/ws/<path>`, and emits a JSON stat block on stdout
-   (schema and source-file rules in §7.5.3):
+1. **Stat/hash sidecar** (`cairn-stat`) — mounts the volume, runs a fixed command
+   over the agent-supplied source path `/mnt/cairn/ws/<path>`, and emits a JSON stat
+   block as its result line (framing in §5.3; schema and source-file rules in
+   §7.5.3):
    ```json
    { "resolved_path": "<absolute path, symlink-resolved | null>",
      "valid":         true,
      "size":          <uint64>,
-     "sha256":        "<sha256sum output>" }
+     "sha256_b64":    "<base64 SHA-256>" }
    ```
+   **The digest is base64, not the hex `sha256sum` prints.** Base64 is what the
+   presigned PUT binds as `x-amz-checksum-sha256` (goutils
+   `GeneratePresignedPutURL`), so it passes straight through to the mint in step 3
+   with no transcoding; hex would be rejected by the object store on every upload.
+
    Symlinks are **accepted**, but the sidecar stats and hashes the **resolved
    target file**, not the link (`resolved_path` is the symlink-resolved absolute
-   path; `null`/absent when the path does not exist). No MIME sniff here — MIME is
-   still sniffed **server-side** at register (§6.1 step 2.3), so it stays
-   trustworthy rather than sidecar-asserted. No network, no credentials (§5.1). The
-   service reads stdout via `ContainerWait` and **rejects the upload if `valid` is
-   false** (missing path, directory, non-regular file) before minting anything.
+   path; `null`/absent when the path does not exist). Size and hash come from a
+   single streaming read, so the two can never disagree — a stat-then-read would
+   leave a window for the file to change between them, and the pair is about to be
+   signed into a URL as a matched set. No MIME sniff here — MIME is still sniffed
+   **server-side** at register (§6.1 step 2.3), so it stays trustworthy rather than
+   sidecar-asserted. No network, no credentials (§5.1). The service reads the result
+   line after `ContainerWait` and **rejects the upload if `valid` is false** (missing
+   path, directory, non-regular file) before minting anything.
 2. **Size cap (fail fast)** — reject on the reported size before minting anything
    (§5.2).
 3. **Mint the staging PUT URL** — bound to that exact size + SHA-256 (§6.1 step 1).
-4. **Upload sidecar** — `curl -T /mnt/cairn/ws/<path>` to the staging URL. The object store
-   **verifies the checksum** and rejects a mismatch.
+4. **Upload sidecar** (`cairn-upload`) — streams `/mnt/cairn/ws/<path>` to the
+   staging URL, sending exactly the signed headers: `Content-Length`,
+   `x-amz-checksum-sha256`, and `Content-Type` only when one was signed (§5.3). The
+   object store **verifies the checksum** and rejects a mismatch. `Content-Length` is
+   sent as the value the service *signed*, not re-derived from a fresh stat of the
+   file — re-deriving it would only mask the drift the checksum bind exists to catch.
 5. **Register / update from staging** — the **existing** core path (§6.1 step 2 /
    §6.3): staging-key verify → size cap re-check → **server-side MIME sniff** →
    `CopyObject` staging→final → insert/update row → delete staging.
@@ -477,11 +570,11 @@ corruption. Same-length changes are caught too, because the bind is on the hash,
 not just `Content-Length`.
 
 **Cost accepted:** the volume file is read **twice** — once by the stat/hash
-sidecar (to hash) and once by the upload sidecar (to transfer). `curl` does not
-re-hash; it sends the checksum the service supplies, and the object store does the
-one authoritative verification. The double read is the price of the presigned-PUT
-integrity contract when the bytes are volume-resident; acceptable for a
-size-capped artifact service.
+sidecar (to hash) and once by the upload sidecar (to transfer). The upload sidecar
+does not re-hash; it sends the checksum the service supplies, and the object store
+does the one authoritative verification. The double read is the price of the
+presigned-PUT integrity contract when the bytes are volume-resident; acceptable for
+a size-capped artifact service.
 
 ### 6.5 Serving artifacts safely (`response-content-disposition=attachment`)
 Every presigned **GET** URL cairn mints (REST fetch-with-`?presign`, MCP
@@ -495,12 +588,11 @@ bound PUT (§6.1) cannot guarantee.
 - **The override is a browser-XSS safeguard only.** It matters solely for
   **browser-facing** GETs (the REST `?presign` URL, a UI download) — a browser
   honors `Content-Disposition: attachment` and downloads instead of rendering. The
-  MCP `download_artifact` sidecar runs `curl -o /mnt/cairn/ws/<path>`, which **ignores**
-  `Content-Disposition` entirely (it writes to the `-o` target regardless), so the
-  override is **inert but harmless** on that path. cairn still mints every GET with
-  `attachment` uniformly rather than branching on the consumer — there is no path
-  where it hurts, and it removes the risk of accidentally minting a
-  non-`attachment` browser URL.
+  MCP `download_artifact` sidecar writes the response body to the destination path
+  it was given and **ignores** `Content-Disposition` entirely, so the override is
+  **inert but harmless** on that path. cairn still mints every GET with `attachment`
+  uniformly rather than branching on the consumer — there is no path where it hurts,
+  and it removes the risk of accidentally minting a non-`attachment` browser URL.
 - Requires a small **goutils** addition: `GeneratePresignedGetURL` currently passes
   `nil` request parameters; it must accept `response-content-disposition`
   (and optionally other `response-*` overrides) to thread through to the presigned
@@ -552,7 +644,7 @@ uses.
 | Tool | Behavior |
 |---|---|
 | `list_artifacts` | List artifacts in a workspace. Same state-filter listing option as REST (§7.1): defaults to `RECORDED`, other states requestable. |
-| `download_artifact` | Object → volume. Presign **GET** (`attachment`, §6.5); sidecar mounts volume at `/mnt/cairn/ws` (§4.4), `curl -o /mnt/cairn/ws/<path>`. Read direction, single sidecar, no core-register step. **The destination directory must already exist** — the agent prepares it first (§7.5.1). |
+| `download_artifact` | Object → volume. Presign **GET** (`attachment`, §6.5); `cairn-download` sidecar mounts the volume at `/mnt/cairn/ws` (§4.4) and writes to `/mnt/cairn/ws/<path>`. Read direction, single sidecar, no core-register step. **The destination directory must already exist** — the agent prepares it first (§7.5.1). |
 | `upload_artifact` | Volume → object, **new** artifact. **Two sidecars** (stat/hash then upload) in front of the staging + register core path, §6.4 / §7.3. Parent workspace must exist (§7.5). |
 | `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same two-sidecar flow as upload (§6.4) but calls the **update** core function. Parent workspace must exist (§7.5). |
 | `delete_artifact` | **Deletes the artifact row** (from `RECORDED` or `MISSING_OBJECT`); the object is reclaimed later by the GC (§8.2.1). Idempotent. |
@@ -566,7 +658,7 @@ the sidecar(s), waits for each (`ContainerWait`), and knows exactly when the wor
 finished (upload = two sidecars in sequence, §6.4; download = one). The REST
 staging→upload→**notify** callback exists only because REST clients are
 asynchronous/external; that asymmetry does not apply to MCP. So the MCP tool does
-**not** curl back into its own REST endpoint — the sidecars only touch the volume
+**not** call back into its own REST endpoint — the sidecars only touch the volume
 and the object store, never the service (§5.1).
 
 `upload_artifact` flow:
@@ -574,13 +666,14 @@ and the object store, never the service (§5.1).
    `(workspace, name)` (upload creates a new artifact). This is a pre-sidecar
    fail-fast; the DB uniqueness constraint remains the real guard (§7.5).
 2. **Stat/hash sidecar**: mount volume, emit the `{resolved_path, valid, size,
-   sha256}` stat block for `/mnt/cairn/ws/<path>` on stdout, exit. Service waits
-   (`ContainerWait`), reads the JSON, **rejects if `valid` is false** (§7.5.3),
-   then applies the size cap (fail fast) (§6.4).
+   sha256_b64}` stat block for `/mnt/cairn/ws/<path>` as a framed result line
+   (§5.3), exit. Service waits (`ContainerWait`), reads the line, **rejects if
+   `valid` is false** (§7.5.3), then applies the size cap (fail fast) (§6.4).
 3. **Presign** staging PUT URL (in-process), bound to that size + SHA-256.
-4. **Upload sidecar**: mount volume, `curl -T /mnt/cairn/ws/<path> <staging-url>`, exit.
-   Service waits (`ContainerWait`). The object store verifies the checksum; a
-   mismatch (changed file) fails the upload (§6.4 — TOCTOU fails closed).
+4. **Upload sidecar**: mount volume, PUT `/mnt/cairn/ws/<path>` to the staging URL
+   with the signed headers (§6.4 step 4), exit. Service waits (`ContainerWait`). The
+   object store verifies the checksum; a mismatch (changed file) fails the upload
+   (§6.4 — TOCTOU fails closed).
 5. On success → **call `RegisterArtifactFromStaging(...)` directly** (in-process):
    verify staging-key prefix → size cap (`GetObjectStat`) → sniff → `CopyObject` →
    insert (constraint-guarded) → delete staging.
@@ -670,24 +763,40 @@ the front-ends differ by more than addressing:
   a coherent tool result.
 
 #### 7.5.1 Download write-path semantics (`download_artifact` → volume)
-The download sidecar runs `curl -o /mnt/cairn/ws/<path>` after path validation
-(§7.5). It does **not** create intermediate directories — **the agent must prepare
-the destination directory before calling `download_artifact`.** cairn cannot safely
-`mkdir -p` the parents: it does not control the UID/GID the tool containers run as
-(§4.2 — multiple external mounters), so any directory the sidecar created would be
-owned by the sidecar's UID and unwritable/undeletable by the real tool containers —
-a downstream permission landmine. Directory layout is the agent's job, done from its
-own correctly-UID'd tool container.
+The `cairn-download` sidecar streams the artifact to `/mnt/cairn/ws/<path>` after
+path validation (§7.5). It does **not** create intermediate directories — **the agent
+must prepare the destination directory before calling `download_artifact`.** cairn
+cannot safely `mkdir -p` the parents: it does not control the UID/GID the tool
+containers run as (§4.2 — multiple external mounters), so any directory the sidecar
+created would be owned by the sidecar's UID and unwritable/undeletable by the real
+tool containers — a downstream permission landmine. Directory layout is the agent's
+job, done from its own correctly-UID'd tool container.
 
 Behavior for the target `/mnt/cairn/ws/<path>`:
 
 | Target path | Behavior |
 |---|---|
-| **parent dir missing** | **Failure** — `curl -o` does not `mkdir -p`. Legible "destination directory does not exist" error; the agent must create it first. |
+| **parent dir missing** | **Failure** — parents are never created. Legible "destination directory does not exist" error; the agent must create it first. |
 | parent exists, nothing at path | Create the file. |
 | regular file | **Overwrite.** |
-| **symlink** | **Link is replaced by a regular file**, *not* followed — `curl -o` `unlink()`s the link and creates a fresh file, so a planted symlink **cannot** be used to write outside the volume. Safe to allow. |
-| **directory** | **Failure** — `curl -o` cannot target a directory. |
+| **symlink** | **Link is replaced by a regular file**, *not* followed — the open is `O_NOFOLLOW`, and the rejection is handled by `unlink()`ing the link and creating a fresh file, so a planted symlink **cannot** be used to write outside the volume. Safe to allow. |
+| **directory** | **Failure** — a directory is not a file to write. |
+
+**Containment is checked twice, and asymmetrically.** The service validates the
+agent-supplied path before launching anything (absolute, and under the mount — a
+component test, so a sibling like `/mnt/cairn/wsX` is rejected, and the mount root
+itself is rejected as a directory). The sidecar then checks again against the real
+filesystem, which is the authoritative check because only it can resolve a symlink.
+
+The two directions resolve *different* things, which is load-bearing:
+
+- **Read paths** (stat, upload) resolve the **full path**, symlinks included — the
+  target is what actually gets hashed and sent, so that is what must stay inside the
+  volume.
+- **Write paths** (download) resolve only the **parent**, leaving the final component
+  alone. A download *replaces* a symlink rather than writing through it, so resolving
+  the link would judge containment against a target that is never written — and would
+  wrongly reject the very case the replace-don't-follow rule already defuses.
 
 On a mid-transfer failure the error is returned to the agent; the sidecar does
 **no** cleanup (a partial file may remain in the volume — acceptable, the volume is
@@ -712,16 +821,22 @@ and emits a stat block; the service acts on it before minting any PUT URL.
 | **does not exist** | **Reject** — `valid = false`, `resolved_path = null`. Legible "source file not found" error; nothing minted. |
 | **directory** | **Reject** — `valid = false`. A directory is not a single uploadable object. |
 | **regular file** | **Accept** — stat + SHA-256 the file. |
+| **non-regular file** (FIFO, socket, device node) | **Reject** — `valid = false`. Its size and hash are meaningless, and there is nothing to bind a PUT URL to. |
 | **symlink** | **Accept only if the resolved target stays under `/mnt/cairn/ws`** (§4.4). The link is **resolved**; the sidecar stats and hashes the **target file**, not the link, and `resolved_path` is the resolved absolute path. A symlink whose target escapes the mount is **rejected** (`valid = false`) — it cannot exfiltrate the sidecar image's files. A symlink to a missing/non-regular target reduces to the reject rows above. |
 
-Emitted stat block (stdout JSON, read via `ContainerWait`):
+Emitted stat block (the framed result line, §5.3, read after `ContainerWait`):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `resolved_path` | string \| null | Absolute, symlink-resolved path of the source file. `null`/absent when the path does not exist. |
+| `resolved_path` | string \| null | Absolute, symlink-resolved path of the source file. `null` when the path does not exist. |
 | `valid` | bool | Whether the source is a valid single-file upload (a regular file, directly or via a symlink whose resolved target stays under `/mnt/cairn/ws`). The service **rejects** the upload when `false`. |
 | `size` | uint64 | Byte size of the resolved file; binds the presigned PUT `Content-Length` (§6.4). |
-| `sha256` | string | `sha256sum` of the resolved file; binds the presigned PUT checksum (§6.4). |
+| `sha256_b64` | string | **Base64** SHA-256 of the resolved file; binds the presigned PUT checksum as `x-amz-checksum-sha256` (§6.4). Not the hex `sha256sum` prints — see §6.4 step 1. |
+| `error` | string | Present only when `valid` is false: why the source was rejected, for the agent-facing error. |
+
+A rejection still carries **every** field — the service reads them unconditionally,
+so `valid: false` fills `size` with `0` and `sha256_b64` with `""` rather than
+omitting them.
 
 `valid` is the sidecar's advisory gate (a fast reject for the common cases); it is
 **not** the integrity boundary — the checksum-bound PUT (§6.4) is. The size/hash
@@ -895,10 +1010,13 @@ not fatal: the level-triggered sweep simply retries them next run.
   an object store + DB behind it; not yet revisited.
 
 **Known prerequisites (not deferred — required before/with implementation):**
-- **goutils `GeneratePresignedGetURL` must accept response overrides** — today it
-  passes `nil` request parameters; it needs to thread
-  `response-content-disposition=attachment` (and optionally other `response-*`
-  overrides) into the presigned GET so cairn's serving discipline (§6.5) works.
+- ~~**goutils `GeneratePresignedGetURL` must accept response overrides**~~ —
+  **done.** It now takes a `contentDisposition *string` and threads it into the
+  presigned GET, which is how §6.5's serving discipline is enforced.
 - **`X-Content-Type-Options: nosniff` is an OPS/serving-edge configuration** — it
   cannot be set from the presigned GET URL (§6.5); the deployment (object-store
   config or a fronting proxy/CDN) must add it. Documented, not enforced in-service.
+- **Sidecar image availability** — the deployment must be able to pull the
+  `cairn-sidecar` image named by `artifact.sidecar.image`, and the transfer sidecars
+  must be able to reach the object store on `artifact.sidecar.networkMode` (§5.1).
+  Both are deployment wiring, not in-service guarantees.

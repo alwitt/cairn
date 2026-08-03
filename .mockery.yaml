@@ -17,3 +17,6 @@ packages:
   github.com/alwitt/cairn/test:
     config:
       all: true
+  github.com/alwitt/cairn/artifact:
+    interfaces:
+      Manager:

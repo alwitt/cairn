@@ -31,3 +31,25 @@ func NewArtifactMangerError(message string, core error, getCallStack bool) Artif
 	}
 	return ArtifactMangerError{BaseError: base}
 }
+
+// ======================================================================================
+// Artifact Operator Error
+
+// ArtifactOperatorError encountered error operating the artifact operator.
+//
+// Distinct from ArtifactMangerError so a caller can tell an orchestration failure - a sidecar
+// that would not start, a source path outside the workspace volume - from the artifact
+// manager rejecting the work itself. A manager error raised mid-operation still surfaces
+// nested inside this one, so `errors.As` against either finds what it is looking for.
+type ArtifactOperatorError struct{ goutils.BaseError }
+
+// NewArtifactOperatorError build a ArtifactOperatorError, optionally capturing the call stack.
+func NewArtifactOperatorError(
+	message string, core error, getCallStack bool,
+) ArtifactOperatorError {
+	base := goutils.BaseError{Name: "ArtifactOperatorError", Message: message, Core: core}
+	if getCallStack {
+		base.Stack = goutils.GetCallStack(1)
+	}
+	return ArtifactOperatorError{BaseError: base}
+}
