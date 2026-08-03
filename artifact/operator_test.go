@@ -121,6 +121,91 @@ func expectSidecarRun(
 	return captured
 }
 
+// capturedLaunch what a sidecar was launched with, recorded at define time.
+//
+// The command is captured alongside the parameters because the two-sidecar write path has to
+// assert WHICH entrypoint ran in which position, not just what each was handed.
+type capturedLaunch struct {
+	name    string
+	command runtime.ContainerCommand
+	params  runtime.DockerRuntimeParams
+}
+
+// entrypoint the single entrypoint the captured launch was given.
+func (c capturedLaunch) entrypoint() string {
+	if len(c.command.Entrypoint) != 1 {
+		return ""
+	}
+	return c.command.Entrypoint[0]
+}
+
+// sidecarRun how one arranged sidecar run in a sequence behaves.
+type sidecarRun struct {
+	// output the combined container output the run produces
+	output string
+	// exitCode the container's exit code
+	exitCode int
+	// startErr when set, the run fails at Start and never reaches Wait
+	startErr error
+	// waitErr when set, the run fails at Wait
+	waitErr error
+}
+
+// expectSidecarSequence arrange a sequence of sidecar launches, capturing what each was
+// launched with.
+//
+// The expectations are consumed in declaration order, so the returned slice is positional:
+// index 0 is the first sidecar the operator defines. Each is `.Once()`, so a run the operator
+// makes but this did not arrange fails the case, which is how the "no second sidecar was ever
+// launched" assertions are made - by omission rather than by a negative check.
+//
+// Cleanup is arranged for every run including the ones that fail to start: the operator
+// registers teardown as soon as the runtime is defined, and a leftover container is exactly
+// what that ordering exists to prevent.
+func expectSidecarSequence(
+	t *testing.T, mocks unitTestOperatorMocks, runs ...sidecarRun,
+) []*capturedLaunch {
+	captured := make([]*capturedLaunch, 0, len(runs))
+
+	for _, run := range runs {
+		record := new(capturedLaunch)
+		captured = append(captured, record)
+
+		sidecar := mockruntime.NewSystemCallRuntime(t)
+		sidecar.EXPECT().Start(mock.Anything).Return(run.startErr).Once()
+		if run.startErr == nil {
+			sidecar.EXPECT().
+				Wait(mock.Anything).
+				Return(
+					runtime.SystemCallResp{ExitCode: run.exitCode, Output: run.output},
+					run.waitErr,
+				).
+				Once()
+		}
+		sidecar.EXPECT().Cleanup(mock.Anything).Return(nil).Once()
+
+		mocks.callbacks.EXPECT().
+			DefineSystemCallDockerRuntime(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			RunAndReturn(func(
+				_ context.Context,
+				name string,
+				command runtime.ContainerCommand,
+				params runtime.DockerRuntimeParams,
+				_ bool,
+			) (runtime.SystemCallRuntime, error) {
+				record.name = name
+				record.command = command
+				record.params = params
+				return sidecar, nil
+			}).
+			Once()
+	}
+
+	return captured
+}
+
 // assertOperatorError verify an error is an ArtifactOperatorError that still carries the
 // original failure at the top of the chain.
 //

@@ -21,16 +21,35 @@ import (
 // URL out of `/proc/<pid>/cmdline` and leaves no argv for an agent-influenced value to reach
 // (see DESIGN §5.1, §5.2).
 
-// sidecarDownloadEntrypoint the download sidecar's entrypoint
-const sidecarDownloadEntrypoint = "cairn-download"
+const (
+	// sidecarStatEntrypoint the stat/hash sidecar's entrypoint
+	sidecarStatEntrypoint = "cairn-stat"
+	// sidecarUploadEntrypoint the upload sidecar's entrypoint
+	sidecarUploadEntrypoint = "cairn-upload"
+	// sidecarDownloadEntrypoint the download sidecar's entrypoint
+	sidecarDownloadEntrypoint = "cairn-download"
+)
 
 const (
 	// sidecarEnvMountRoot names the volume mount path for the sidecar
 	sidecarEnvMountRoot = "CAIRN_MOUNT_ROOT"
+	// sidecarEnvSourcePath names the source file the stat and upload sidecars read
+	sidecarEnvSourcePath = "CAIRN_SOURCE_PATH"
 	// sidecarEnvTargetPath names the destination file the download sidecar writes
 	sidecarEnvTargetPath = "CAIRN_TARGET_PATH"
 	// sidecarEnvURL carries the presigned URL. Never logged (see DESIGN §5.2).
 	sidecarEnvURL = "CAIRN_URL"
+	// sidecarEnvObjectSize carries the byte size the upload sidecar sends as `Content-Length`
+	sidecarEnvObjectSize = "CAIRN_OBJECT_SIZE"
+	// sidecarEnvSHA256B64 carries the base64 SHA-256 the upload sidecar sends as
+	// `x-amz-checksum-sha256`
+	sidecarEnvSHA256B64 = "CAIRN_SHA256_B64"
+
+	// There is deliberately no constant for the sidecar's `CAIRN_CONTENT_TYPE`. The upload
+	// sidecar sends a `Content-Type` header only when that variable is set, and the
+	// volume-based path signs none - MIME is sniffed server-side at register, so there is no
+	// verified value to sign here (see DESIGN §6.4). Setting it would put an unsigned header
+	// on a signature-bound PUT, which the object store rejects.
 )
 
 // sidecarContainerName build the container name for a sidecar run.

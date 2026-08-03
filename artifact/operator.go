@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/alwitt/cairn/db"
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
 	"github.com/alwitt/goutils/runtime"
@@ -100,6 +101,87 @@ type Operator interface {
 		artifact models.Artifact,
 		targetPath string,
 	) error
+
+	/*
+		UploadArtifact record a new artifact from a file in a workspace's persistent volume.
+
+		The write direction of the artifact transfer, and two sidecars rather than one: a
+		staging PUT URL is bound to the file's exact size and base64 SHA-256 before it can be
+		minted, and the bytes live in the volume where only a sidecar can reach them. So a
+		stat/hash sidecar derives the pair, and an upload sidecar sends the file with exactly
+		the headers that were signed (see DESIGN §6.4, §7.3).
+
+		Neither sidecar calls back into this service, and only the upload one holds an object
+		store credential - a presigned URL scoped to one key and one operation (see DESIGN
+		§5.1, §5.2).
+
+		The name is pre-checked as free before either sidecar runs, so a taken name costs no
+		container runs. The database's uniqueness constraint remains the real guard for a
+		caller that races another (see DESIGN §7.5).
+
+		A file that changes on the volume between the two sidecars fails closed: the uploaded
+		bytes no longer match the checksum the PUT was signed for, and the object store
+		rejects it (see DESIGN §6.4).
+
+		The parent workspace is taken as already resolved by the caller (see DESIGN §3).
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - workspace this is for
+			@param sourcePath string - the file to upload, within the workspace volume. Must
+			    be absolute, and within the volume mount.
+			@param name string - name a user will reference the artifact by
+			@param description *string - an optional description for the artifact
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it. Normally pass nil: a transaction handed in here is held open across
+			    both container runs, and the only work inside it is the name pre-check and the
+			    final insert.
+			@returns the new artifact entry
+	*/
+	UploadArtifact(
+		ctx context.Context,
+		workspace models.Workspace,
+		sourcePath string,
+		name string,
+		description *string,
+		activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
+		UpdateArtifact replace an existing artifact's content from a file in a workspace's
+		persistent volume.
+
+		The same two-sidecar flow as UploadArtifact over the same staging core, differing only
+		at the ends: the target artifact is resolved by the caller rather than named, and the
+		staged object updates a row instead of inserting one (see DESIGN §6.3, §7.3).
+
+		An artifact quarantined as `MISSING_OBJECT` is a legitimate target - re-uploading its
+		content is how one is repaired - so there is no artifact-state gate here, unlike
+		DownloadArtifact (see DESIGN §6.3).
+
+		Concurrent updates to one artifact are last-writer-wins; each writer stages to its own
+		key and the final row update decides the winner (see DESIGN §7.5.2).
+
+		The parent workspace and the artifact are taken as already resolved by the caller, and
+		the artifact must belong to the workspace (see DESIGN §3).
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - workspace this is for
+			@param artifact models.Artifact - the artifact whose content is replaced
+			@param sourcePath string - the file to upload, within the workspace volume. Must
+			    be absolute, and within the volume mount.
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it. Normally pass nil, for the reason given on UploadArtifact.
+			@returns the updated artifact entry
+	*/
+	UpdateArtifact(
+		ctx context.Context,
+		workspace models.Workspace,
+		artifact models.Artifact,
+		sourcePath string,
+		activeSession db.Database,
+	) (models.Artifact, error)
 }
 
 // dockerOperatorImpl implements Operator using docker as the runtime driver

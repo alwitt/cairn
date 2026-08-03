@@ -549,6 +549,13 @@ core path unchanged:
 2. **Size cap (fail fast)** — reject on the reported size before minting anything
    (§5.2).
 3. **Mint the staging PUT URL** — bound to that exact size + SHA-256 (§6.1 step 1).
+   **The volume-based path signs no `Content-Type`.** The staging-based path (§6.1)
+   can, because its caller holds the bytes and may legitimately know what they are;
+   here nothing has looked at the content — the stat sidecar deliberately does not
+   sniff (step 1) — so there is no verified value to bind, and signing a guess would
+   commit the upload to a header the service invented. MIME arrives later, from the
+   server-side sniff at register (§6.1 step 2.3), which is the only MIME authority
+   on this path.
 4. **Upload sidecar** (`cairn-upload`) — streams `/mnt/cairn/ws/<path>` to the
    staging URL, sending exactly the signed headers: `Content-Length`,
    `x-amz-checksum-sha256`, and `Content-Type` only when one was signed (§5.3). The
@@ -674,7 +681,7 @@ and the object store, never the service (§5.1).
    with the signed headers (§6.4 step 4), exit. Service waits (`ContainerWait`). The
    object store verifies the checksum; a mismatch (changed file) fails the upload
    (§6.4 — TOCTOU fails closed).
-5. On success → **call `RegisterArtifactFromStaging(...)` directly** (in-process):
+5. On success → **call `RegisterNewArtifact(...)` directly** (in-process):
    verify staging-key prefix → size cap (`GetObjectStat`) → sniff → `CopyObject` →
    insert (constraint-guarded) → delete staging.
 6. Return the tool result from the core function's outcome.
@@ -687,7 +694,7 @@ pre-check and a different core function:
   (§7.5), rather than checking the name is free. Spending two sidecars only to have
   the core function reject an unknown/inactive target is wasteful; this fails
   before either sidecar runs.
-- **Step 5 calls `UpdateArtifactFromStaging(...)`** — same staging-key verify and
+- **Step 5 calls `UpdateArtifactContent(...)`** — same staging-key verify and
   size cap, then updates the row instead of inserting (§6.3).
 
 Either path's stat/hash sidecar (step 2) is also a **backup validity gate**: its
@@ -696,7 +703,7 @@ pre-check and the sidecar run.
 
 **Reuse pattern — one core function, two front-doors:**
 ```
-RegisterArtifactFromStaging(ctx, workspace, name, staging_key, …) → (artifact, error)
+RegisterNewArtifact(ctx, workspace, staging_key, name, description, …) → (artifact, error)
    ├── REST handler → thin HTTP shim (unmarshal → core → marshal)
    └── MCP upload   → calls core directly after the upload container exits
 ```
@@ -727,7 +734,7 @@ the front-ends differ by more than addressing:
 
 ### 7.5 Handler-level validation & preconditions (all volume-touching ops)
 - **Parent workspace must exist** — every artifact create/update
-  (`RegisterArtifactFromStaging`, `UpdateArtifactFromStaging`, and the
+  (`RegisterNewArtifact`, `UpdateArtifactContent`, and the
   `upload_artifact` / `update_artifact` MCP tools that call them) refuses unless the
   parent workspace row is present. A workspace delete is an atomic row delete (§4.1),
   so there is no half-deleted window to race: either the row is there (writes
@@ -735,8 +742,8 @@ the front-ends differ by more than addressing:
   would reject the insert anyway). Read paths (`download_artifact`, list/fetch) are
   not gated on this.
 - **Single-PUT size cap** — enforced by both core functions via a `GetObjectStat`
-  on the staging object: `RegisterArtifactFromStaging` (§6.1 step 2.2) and
-  `UpdateArtifactFromStaging` (§6.3), and therefore by both the `upload_artifact`
+  on the staging object: `RegisterNewArtifact` (§6.1 step 2.2) and
+  `UpdateArtifactContent` (§6.3), and therefore by both the `upload_artifact`
   and `update_artifact` MCP tools, which route through them. An over-cap staging
   object is rejected before `CopyObject`; no row is created/updated (§5.2).
 - **Volume path validation** — the agent-supplied path must be **absolute and under

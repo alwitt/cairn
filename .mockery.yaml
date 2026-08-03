@@ -18,5 +18,5 @@ packages:
     config:
       all: true
   github.com/alwitt/cairn/artifact:
-    interfaces:
-      Manager:
+    config:
+      all: true
