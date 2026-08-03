@@ -21,7 +21,7 @@ lint: .prep ## Run python lint
 .PHONY: build
 build: lint ## Build module
 	poetry build
-	cp dist/*.whl /tmp -v
+	poetry export -f requirements.txt > requirements.txt
 
 .PHONY: test
 test: ## Run unit-tests
@@ -34,6 +34,10 @@ one-test: ## Run specific unit-tests
 # .PHONY: install
 install: build ## Install module
 	poetry install
+
+.PHONY: docker
+docker: ## Build side cart dev docker image
+	docker build -t "alwitt/cairn-sidecar:latest" -f Dockerfile .
 
 .PHONY: cli
 cli: .prep ## Run venv python CLI

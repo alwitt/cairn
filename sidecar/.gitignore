@@ -9,6 +9,7 @@ dist/
 .mypy_cache/
 .prep
 test-reports/
+requirements.txt
 
 # Poetry virtualenv (if created in-project)
 .venv/
