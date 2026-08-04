@@ -132,8 +132,19 @@ type ArtifactKeyConfig struct {
 }
 
 // StagingKeyPrefix helper function to construct the artifact staging object key prefix
+// common to all workspaces
+func (c ArtifactKeyConfig) StagingKeyPrefix() string {
+	pieces := []string{}
+	if c.BasePrefix != nil {
+		pieces = append(pieces, *c.BasePrefix)
+	}
+	pieces = append(pieces, c.StagingPrefix)
+	return filepath.Join(pieces...)
+}
+
+// WorkspaceStagingKeyPrefix helper function to construct the artifact staging object key prefix
 // for a particular workspace
-func (c ArtifactKeyConfig) StagingKeyPrefix(workspaceID string) string {
+func (c ArtifactKeyConfig) WorkspaceStagingKeyPrefix(workspaceID string) string {
 	pieces := []string{}
 	if c.BasePrefix != nil {
 		pieces = append(pieces, *c.BasePrefix)
@@ -144,8 +155,19 @@ func (c ArtifactKeyConfig) StagingKeyPrefix(workspaceID string) string {
 }
 
 // StoreKeyPrefix helper function to construct the artifact storage object key prefix
+// common to all workspaces
+func (c ArtifactKeyConfig) StoreKeyPrefix() string {
+	pieces := []string{}
+	if c.BasePrefix != nil {
+		pieces = append(pieces, *c.BasePrefix)
+	}
+	pieces = append(pieces, c.StorePrefix)
+	return filepath.Join(pieces...)
+}
+
+// WorkspaceStoreKeyPrefix helper function to construct the artifact storage object key prefix
 // for a particular workspace
-func (c ArtifactKeyConfig) StoreKeyPrefix(workspaceID string) string {
+func (c ArtifactKeyConfig) WorkspaceStoreKeyPrefix(workspaceID string) string {
 	pieces := []string{}
 	if c.BasePrefix != nil {
 		pieces = append(pieces, *c.BasePrefix)
@@ -248,6 +270,29 @@ type ArtifactManagerConfig struct {
 }
 
 // ======================================================================================
+// Maintenance Config
+
+// MaintenanceConfig maintenance system config
+type MaintenanceConfig struct {
+	// MaintenanceSweepIntSec number of seconds between maintenance sweep
+	MaintenanceSweepIntSec int `mapstructure:"sweepIntSec" json:"sweepIntSec" validate:"required,gt=0"`
+
+	// OrphanedObjectAgeOutSec number of seconds after which an orphaned object will be deleted from
+	// the object store
+	OrphanedObjectAgeOutSec int `mapstructure:"objAgeOutSec" json:"objAgeOutSec" validate:"required,gt=0"`
+}
+
+// MaintenanceSweepInt convert MaintenanceSweepIntSec to time.Duration
+func (c MaintenanceConfig) MaintenanceSweepInt() time.Duration {
+	return time.Second * time.Duration(c.MaintenanceSweepIntSec)
+}
+
+// OrphanedObjectAgeOut convert OrphanedObjectAgeOutSec to time.Duration
+func (c MaintenanceConfig) OrphanedObjectAgeOut() time.Duration {
+	return time.Second * time.Duration(c.OrphanedObjectAgeOutSec)
+}
+
+// ======================================================================================
 // Application Config
 
 // ApplicationConfig application config
@@ -266,4 +311,7 @@ type ApplicationConfig struct {
 
 	// Artifact artifact configuration
 	Artifact ArtifactManagerConfig `mapstructure:"artifact" json:"artifact" validate:"required"`
+
+	// Maintenance maintenance system configuration
+	Maintenance MaintenanceConfig `mapstructure:"maintenance" json:"maintenance" validate:"required"`
 }

@@ -73,7 +73,7 @@ func (c *databaseImpl) DefineNewWorkspace(
 			ID:             workspaceID,
 			Name:           params.Name,
 			Description:    params.Description,
-			VolumeName:     fmt.Sprintf("%s-%s", params.AppName, workspaceID),
+			VolumeName:     models.WorkspaceVolumeName(params.AppName, workspaceID),
 			VolumeState:    models.WorkspaceVolumeStateNone,
 			VolumeMetadata: volumeMetadata,
 		},

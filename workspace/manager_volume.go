@@ -155,7 +155,7 @@ Docker holds but the DB does not (see DESIGN §8.2.2).
 	@returns the names of the observed volumes
 */
 func (m *managerImpl) ListWorkspaceVolumes(ctx context.Context) ([]string, error) {
-	prefix := fmt.Sprintf("%s-", m.appName)
+	prefix := models.WorkspaceVolumeNamePrefix(m.appName)
 
 	observed, err := m.volumes.ListVolumes(ctx, &prefix)
 	if err != nil {

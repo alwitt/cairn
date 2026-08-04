@@ -429,7 +429,7 @@ func NewManager(
 // and carries no caller-controlled content (see DESIGN §2.2, §8.1).
 func (m *managerImpl) newStagingObjectKey(workspaceID string) string {
 	return filepath.Join(
-		m.storeConfig.Prefix.StagingKeyPrefix(workspaceID), ulid.Make().String(),
+		m.storeConfig.Prefix.WorkspaceStagingKeyPrefix(workspaceID), ulid.Make().String(),
 	)
 }
 
@@ -439,7 +439,7 @@ func (m *managerImpl) newStagingObjectKey(workspaceID string) string {
 // it, never editing an object in place (see DESIGN §6.2, §6.3).
 func (m *managerImpl) newStoreObjectKey(workspaceID string) string {
 	return filepath.Join(
-		m.storeConfig.Prefix.StoreKeyPrefix(workspaceID), ulid.Make().String(),
+		m.storeConfig.Prefix.WorkspaceStoreKeyPrefix(workspaceID), ulid.Make().String(),
 	)
 }
 
@@ -450,7 +450,7 @@ func (m *managerImpl) newStoreObjectKey(workspaceID string) string {
 // so a prefix match proves the key was minted for this workspace and rejects one aimed at
 // another (see DESIGN §6.1 step 2.1).
 func (m *managerImpl) verifyStagingKeyOwnership(workspaceID string, stagingObjKey string) error {
-	prefix := m.storeConfig.Prefix.StagingKeyPrefix(workspaceID) + "/"
+	prefix := m.storeConfig.Prefix.WorkspaceStagingKeyPrefix(workspaceID) + "/"
 	if !strings.HasPrefix(stagingObjKey, prefix) {
 		return goutils.NewBadInputError(
 			fmt.Sprintf(

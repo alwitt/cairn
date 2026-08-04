@@ -53,3 +53,24 @@ func NewArtifactOperatorError(
 	}
 	return ArtifactOperatorError{BaseError: base}
 }
+
+// ======================================================================================
+// Maintenance Module Error
+
+// MaintenanceError encountered error operating the system maintenance manager.
+//
+// Reconciliation reports what it could not settle through this, with the failure that caused
+// it nested inside - a `goutils.SQLError` from cairn's own DB, a `goutils.DockerError` from an
+// unreachable daemon. The nesting is what the maintenance loop's failure policy relies on: it
+// halts on a DB error but rides out a transient external one, and `errors.As` is how it tells
+// them apart (see DESIGN §8.3.2).
+type MaintenanceError struct{ goutils.BaseError }
+
+// NewMaintenanceError build a MaintenanceError, optionally capturing the call stack.
+func NewMaintenanceError(message string, core error, getCallStack bool) MaintenanceError {
+	base := goutils.BaseError{Name: "MaintenanceError", Message: message, Core: core}
+	if getCallStack {
+		base.Stack = goutils.GetCallStack(1)
+	}
+	return MaintenanceError{BaseError: base}
+}

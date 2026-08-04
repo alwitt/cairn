@@ -39,6 +39,37 @@ func (WorkspaceVolumeStateENUM) Values() []WorkspaceVolumeStateENUM {
 // fixed for the first cut (see DESIGN §4.4).
 const WorkspaceMountPath = "/mnt/cairn/ws"
 
+/*
+WorkspaceVolumeNamePrefix the prefix every one of this deployment's workspace persistent volume
+names carries.
+
+The application name namespaces a deployment's volumes (see DESIGN §2.1), so listing on this
+prefix is what lets reconciliation see the volumes Docker holds - including ones no workspace
+row claims (see DESIGN §8.2.2).
+
+	@param appName string - the per-deployment application name
+	@returns the volume name prefix
+*/
+func WorkspaceVolumeNamePrefix(appName string) string {
+	return fmt.Sprintf("%s-", appName)
+}
+
+/*
+WorkspaceVolumeName derive a workspace's persistent volume name.
+
+Derived from the immutable workspace ID rather than its name, so it is stable across a rename
+(see DESIGN §2.1). Persistence computes it once at workspace-create and stores it in
+`Workspace.VolumeName`; nothing else re-derives it, so this exists to keep the rule that
+produces the name and the prefix that finds it from ever drifting apart.
+
+	@param appName string - the per-deployment application name
+	@param workspaceID string - the workspace ID
+	@returns the volume name
+*/
+func WorkspaceVolumeName(appName string, workspaceID string) string {
+	return WorkspaceVolumeNamePrefix(appName) + workspaceID
+}
+
 // WorkspaceVolumeTypeENUM workspace persistence volume type
 type WorkspaceVolumeTypeENUM string
 
