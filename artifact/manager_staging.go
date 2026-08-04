@@ -69,9 +69,18 @@ func (m *managerImpl) GetArtifactStagingPutURL(
 
 	stagingObjKey := m.newStagingObjectKey(workspace.ID)
 
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return StagingUploadBundle{}, models.NewArtifactMangerError(
+			fmt.Sprintf(
+				"failed to generate staging upload URL for workspace %s", workspace.ID,
+			), err, true,
+		)
+	}
+
 	// The TTL bounds, the non-negative size, and the checksum's base64 encoding are all
 	// validated by the object store client, so they are not re-checked here.
-	putURL, err := m.s3.GeneratePresignedPutURL(
+	putURL, err := s3Client.GeneratePresignedPutURL(
 		ctx,
 		m.storeConfig.Bucket,
 		stagingObjKey,
@@ -160,9 +169,14 @@ func (m *managerImpl) RegisterNewArtifact(
 		return failure(err)
 	}
 
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return failure(err)
+	}
+
 	// Measure what actually landed. The mint-time check trusted a caller-declared size; this
 	// one is authoritative, and runs before any copy so an over-cap object costs nothing.
-	stagingStat, err := m.s3.GetObjectStat(ctx, m.storeConfig.Bucket, stagingObjKey)
+	stagingStat, err := s3Client.GetObjectStat(ctx, m.storeConfig.Bucket, stagingObjKey)
 	if err != nil {
 		return failure(err)
 	}
@@ -179,10 +193,15 @@ func (m *managerImpl) RegisterNewArtifact(
 
 	storeObjKey := m.newStoreObjectKey(workspace.ID)
 
+	s3Client, err = m.s3Client(ctx)
+	if err != nil {
+		return failure(err)
+	}
+
 	// Staging and storage share one bucket, distinguished by key prefix (see DESIGN §8.1), so
 	// this is a server-side copy within the bucket that rewrites the MIME type to the sniffed
 	// value.
-	if err := m.s3.CopyObject(
+	if err := s3Client.CopyObject(
 		ctx, m.storeConfig.Bucket, stagingObjKey, m.storeConfig.Bucket, storeObjKey, &mimeType,
 	); err != nil {
 		return failure(err)
@@ -215,8 +234,15 @@ func (m *managerImpl) RegisterNewArtifact(
 
 	// Best-effort: the entry is already committed, so failing the call over leftover staging
 	// debris would be strictly worse than leaving it. The maintenance sweep reclaims aged
-	// staging objects (see DESIGN §6.1 step 7, §8.2.1).
-	if err := m.s3.DeleteObject(ctx, m.storeConfig.Bucket, stagingObjKey); err != nil {
+	// staging objects (see DESIGN §6.1 step 7, §8.2.1). Failing to even acquire a client is
+	// the same class of failure, so it takes the same path.
+	if s3Client, err := m.s3Client(ctx); err != nil {
+		log.
+			WithError(err).
+			WithFields(logTags).
+			WithField("staging_object_key", stagingObjKey).
+			Warn("Failed to acquire object store client to delete staging object; left for reclamation")
+	} else if err := s3Client.DeleteObject(ctx, m.storeConfig.Bucket, stagingObjKey); err != nil {
 		log.
 			WithError(err).
 			WithFields(logTags).
@@ -289,9 +315,14 @@ func (m *managerImpl) UpdateArtifactContent(
 		return failure(err)
 	}
 
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return failure(err)
+	}
+
 	// Measure what actually landed, before any copy, so an over-cap object costs nothing and
 	// leaves the entry pointing at its existing content.
-	stagingStat, err := m.s3.GetObjectStat(ctx, m.storeConfig.Bucket, stagingObjKey)
+	stagingStat, err := s3Client.GetObjectStat(ctx, m.storeConfig.Bucket, stagingObjKey)
 	if err != nil {
 		return failure(err)
 	}
@@ -313,7 +344,12 @@ func (m *managerImpl) UpdateArtifactContent(
 	// DESIGN §6.2).
 	storeObjKey := m.newStoreObjectKey(artifact.WorkspaceID)
 
-	if err := m.s3.CopyObject(
+	s3Client, err = m.s3Client(ctx)
+	if err != nil {
+		return failure(err)
+	}
+
+	if err := s3Client.CopyObject(
 		ctx, m.storeConfig.Bucket, stagingObjKey, m.storeConfig.Bucket, storeObjKey, &mimeType,
 	); err != nil {
 		return failure(err)
@@ -347,8 +383,15 @@ func (m *managerImpl) UpdateArtifactContent(
 
 	// Best-effort: the entry already points at the new object, so failing the call over
 	// leftover staging debris would be strictly worse than leaving it. The maintenance sweep
-	// reclaims aged staging objects (see DESIGN §8.2.1).
-	if err := m.s3.DeleteObject(ctx, m.storeConfig.Bucket, stagingObjKey); err != nil {
+	// reclaims aged staging objects (see DESIGN §8.2.1). Failing to even acquire a client is
+	// the same class of failure, so it takes the same path.
+	if s3Client, err := m.s3Client(ctx); err != nil {
+		log.
+			WithError(err).
+			WithFields(logTags).
+			WithField("staging_object_key", stagingObjKey).
+			Warn("Failed to acquire object store client to delete staging object; left for reclamation")
+	} else if err := s3Client.DeleteObject(ctx, m.storeConfig.Bucket, stagingObjKey); err != nil {
 		log.
 			WithError(err).
 			WithFields(logTags).

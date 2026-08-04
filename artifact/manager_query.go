@@ -170,8 +170,15 @@ func (m *managerImpl) GenerateGetURLForArtifact(
 
 	disposition := getURLContentDisposition
 
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return "", models.NewArtifactMangerError(
+			fmt.Sprintf("failed to generate GET URL for artifact %s", artifact.ID), err, true,
+		)
+	}
+
 	// The TTL bounds are validated by the object store client, so they are not re-checked here.
-	getURL, err := m.s3.GeneratePresignedGetURL(
+	getURL, err := s3Client.GeneratePresignedGetURL(
 		ctx, m.storeConfig.Bucket, artifact.ObjectKey, ttl, &disposition,
 	)
 	if err != nil {

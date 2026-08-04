@@ -334,7 +334,7 @@ type managerImpl struct {
 
 	persistence db.Client
 
-	s3 goutils.S3Client
+	s3Manager goutils.S3ClientManager
 
 	// storeConfig artifact storage config
 	storeConfig models.ArtifactStorageConfig
@@ -348,8 +348,10 @@ NewManager define a new artifact manager
 
 	@param appName string - the per-deployment application name
 	@param persistence db.Client - persistence client
-	@param s3 goutils.S3Client - object store client holding this deployment's credentials.
-	    Its lifecycle is the caller's responsibility.
+	@param s3Manager goutils.S3ClientManager - provides the object store client holding this
+	    deployment's credentials. The manager owns the client's lifecycle, replacing it once
+	    it has aged past its TTL, so a client is acquired per object store call rather than
+	    held on to.
 	@param storeConfig models.ArtifactStorageConfig - artifact storage config
 	@param detectMIMEType MIMETypeDetector - derives an object's MIME type from its leading
 	    bytes. Pass `DefaultMIMETypeDetector` outside of tests.
@@ -358,7 +360,7 @@ NewManager define a new artifact manager
 func NewManager(
 	appName string,
 	persistence db.Client,
-	s3 goutils.S3Client,
+	s3Manager goutils.S3ClientManager,
 	storeConfig models.ArtifactStorageConfig,
 	detectMIMEType MIMETypeDetector,
 ) (Manager, error) {
@@ -383,8 +385,10 @@ func NewManager(
 		return nil, goutils.NewValidationError("persistence client is required", nil, true)
 	}
 
-	if s3 == nil {
-		return nil, goutils.NewValidationError("object store client is required", nil, true)
+	if s3Manager == nil {
+		return nil, goutils.NewValidationError(
+			"object store client manager is required", nil, true,
+		)
 	}
 
 	// Required rather than defaulted to `DefaultMIMETypeDetector`, so the choice of detector
@@ -411,7 +415,7 @@ func NewManager(
 		appName:        appName,
 		validator:      validate,
 		persistence:    persistence,
-		s3:             s3,
+		s3Manager:      s3Manager,
 		storeConfig:    storeConfig,
 		detectMIMEType: detectMIMEType,
 	}
@@ -475,6 +479,19 @@ func (m *managerImpl) enforceSizeCap(size int64, subject string) error {
 	return nil
 }
 
+// s3Client acquire the object store client to use for a single call.
+//
+// The client manager hands back a shared client and rebuilds it once it has aged past its TTL,
+// which is how a client that has quietly lost its connection to the object store gets replaced.
+// A call site therefore asks for one each time rather than holding on to it. The error is
+// returned unwrapped; every call site already wraps object store failures in its own error.
+//
+// This is the one place the wall clock is read - the TTL the client manager enforces is
+// wall-clock based, so the current time is what it needs.
+func (m *managerImpl) s3Client(ctx context.Context) (goutils.S3Client, error) {
+	return m.s3Manager.GetClient(ctx, time.Now().UTC())
+}
+
 // sniffObjectMIMEType derive an object's MIME type by reading its leading bytes.
 //
 // The upload source is not trusted to declare its own MIME type, so the server derives it
@@ -483,7 +500,12 @@ func (m *managerImpl) enforceSizeCap(size int64, subject string) error {
 func (m *managerImpl) sniffObjectMIMEType(
 	ctx context.Context, objectKey string,
 ) (string, error) {
-	_, reader, err := m.s3.GetObject(ctx, m.storeConfig.Bucket, objectKey)
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	_, reader, err := s3Client.GetObject(ctx, m.storeConfig.Bucket, objectKey)
 	if err != nil {
 		return "", err
 	}

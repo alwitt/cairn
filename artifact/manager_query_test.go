@@ -426,6 +426,28 @@ func TestManagerGenerateGetURLForArtifact(t *testing.T) {
 		assert.Empty(getURL)
 	})
 
+	t.Run("surfaces an object store client acquisition failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		entry := sampleArtifact(sampleWorkspace("test-workspace"), "unservable")
+		acquireErr := fmt.Errorf("object store client unavailable")
+
+		// No client to mint with, so no object store expectation: the failure surfaces from
+		// the acquisition itself, wrapped the same way a mint failure would be.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, acquireErr).
+			Once()
+
+		getURL, err := manager.GenerateGetURLForArtifact(
+			context.Background(), entry, time.Minute,
+		)
+
+		assertManagerError(assert, err, acquireErr)
+		assert.Empty(getURL)
+	})
+
 	t.Run("surfaces a mint failure", func(t *testing.T) {
 		assert := assert.New(t)
 		manager, mocks := newUnitTestManager(t)

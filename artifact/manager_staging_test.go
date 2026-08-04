@@ -60,6 +60,7 @@ func unitTestStoreConfig() models.ArtifactStorageConfig {
 type unitTestManagerMocks struct {
 	persistence *mockdb.Client
 	s3          *mockgoutils.S3Client
+	s3Manager   *mockgoutils.S3ClientManager
 	callbacks   *mocktest.UnitTestCallbackCollector
 }
 
@@ -74,26 +75,47 @@ func runTxForManager(
 	}
 }
 
-// newUnitTestManager build a Manager over mocked persistence, object store, and MIME detector.
-// No expectations are set, so any call a case did not arrange for fails that case.
-func newUnitTestManager(t *testing.T) (artifact.Manager, unitTestManagerMocks) {
+// newUnitTestManagerCore build a Manager over mocked persistence, object store client manager,
+// and MIME detector. No expectations are set at all - including on the client manager - so a
+// case can arrange object store client acquisition itself. Use `newUnitTestManager` unless the
+// case is specifically about acquisition.
+func newUnitTestManagerCore(t *testing.T) (artifact.Manager, unitTestManagerMocks) {
 	assert := assert.New(t)
 
 	mocks := unitTestManagerMocks{
 		persistence: mockdb.NewClient(t),
 		s3:          mockgoutils.NewS3Client(t),
+		s3Manager:   mockgoutils.NewS3ClientManager(t),
 		callbacks:   mocktest.NewUnitTestCallbackCollector(t),
 	}
 
 	manager, err := artifact.NewManager(
 		unitTestAppName,
 		mocks.persistence,
-		mocks.s3,
+		mocks.s3Manager,
 		unitTestStoreConfig(),
 		mocks.callbacks.EstimateMIMEType,
 	)
 	assert.Nil(err)
 	assert.NotNil(manager)
+
+	return manager, mocks
+}
+
+// newUnitTestManager build a Manager as `newUnitTestManagerCore` does, with the client manager
+// arranged to hand out the mock object store client on demand. Beyond that no expectations are
+// set, so any call a case did not arrange for fails that case.
+//
+// The acquisition arrangement is optional (`Maybe`) because the manager acquires a client per
+// object store call, so a case which never reaches the object store never acquires one - and a
+// required expectation would fail it at cleanup.
+func newUnitTestManager(t *testing.T) (artifact.Manager, unitTestManagerMocks) {
+	manager, mocks := newUnitTestManagerCore(t)
+
+	mocks.s3Manager.EXPECT().
+		GetClient(mock.Anything, mock.Anything).
+		Return(mocks.s3, nil).
+		Maybe()
 
 	return manager, mocks
 }
@@ -326,6 +348,63 @@ func TestManagerGetArtifactStagingPutURL(t *testing.T) {
 		)
 
 		assert.Nil(err)
+	})
+
+	t.Run("acquires an object store client with the current timestamp", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		presigned, err := url.Parse("https://s3.unit-test/staged?signature=abc")
+		assert.Nil(err)
+
+		// A client is acquired per call rather than held, and the client manager ages one out
+		// against the timestamp it is given - so a zero or stale one would quietly defeat the
+		// TTL that exists to replace a client that has lost its connection.
+		var acquiredAt time.Time
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Run(func(_ context.Context, timestamp time.Time) {
+				acquiredAt = timestamp
+			}).
+			Return(mocks.s3, nil).
+			Once()
+
+		mocks.s3.EXPECT().
+			GeneratePresignedPutURL(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything,
+			).
+			Return(presigned, nil).
+			Once()
+
+		_, err = manager.GetArtifactStagingPutURL(
+			context.Background(), workspace, 32, "c3VjY2Vzcw==", nil,
+		)
+
+		assert.Nil(err)
+		assert.WithinDuration(time.Now().UTC(), acquiredAt, time.Minute)
+	})
+
+	t.Run("surfaces an object store client acquisition failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		acquireErr := fmt.Errorf("object store client unavailable")
+
+		// No client to mint with, so no object store expectation: the failure surfaces from
+		// the acquisition itself, wrapped the same way a mint failure would be.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, acquireErr).
+			Once()
+
+		bundle, err := manager.GetArtifactStagingPutURL(
+			context.Background(), sampleWorkspace("test-workspace"), 32, "ZmFpbA==", nil,
+		)
+
+		assertManagerError(assert, err, acquireErr)
+		assert.Equal(artifact.StagingUploadBundle{}, bundle)
 	})
 
 	t.Run("surfaces a mint failure", func(t *testing.T) {
@@ -661,6 +740,28 @@ func TestManagerRegisterNewArtifact(t *testing.T) {
 		assert.Equal(models.Artifact{}, entry)
 	})
 
+	t.Run("surfaces an object store client acquisition failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		acquireErr := fmt.Errorf("object store client unavailable")
+
+		// Acquisition precedes the authoritative stat, so nothing is measured, copied, or
+		// recorded - no object store or persistence expectation is set.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, acquireErr).
+			Once()
+
+		entry, err := manager.RegisterNewArtifact(
+			context.Background(), workspace, stagingKeyFor(workspace), "unregistered", nil, nil,
+		)
+
+		assertManagerError(assert, err, acquireErr)
+		assert.Equal(models.Artifact{}, entry)
+	})
+
 	t.Run("surfaces a stat failure", func(t *testing.T) {
 		assert := assert.New(t)
 		manager, mocks := newUnitTestManager(t)
@@ -851,6 +952,68 @@ func TestManagerRegisterNewArtifact(t *testing.T) {
 
 		// The entry is already committed by this point, so failing the call over leftover
 		// staging debris would be strictly worse than leaving it (see DESIGN §6.1 step 7).
+		assert.Nil(err)
+		assert.Equal(expected, entry)
+	})
+
+	t.Run("succeeds when the cleanup cannot acquire a client", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		stagingObjKey := stagingKeyFor(workspace)
+		mimeType := "text/plain; charset=utf-8"
+		expected := models.Artifact{ID: ulid.Make().String(), Name: "kept"}
+
+		// Registration acquires four times - stat, sniff, copy, then the best-effort delete.
+		// The first three succeed and the last fails, so acquisition breaks only once the
+		// entry is already committed.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(mocks.s3, nil).
+			Times(3)
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, fmt.Errorf("object store client unavailable")).
+			Once()
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+		// No DeleteObject expectation: without a client the delete is never attempted.
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			DefineNewArtifact(mock.Anything, mock.Anything).
+			Return(expected, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		entry, err := manager.RegisterNewArtifact(
+			context.Background(), workspace, stagingObjKey, "kept", nil, nil,
+		)
+
+		// Failing to acquire a client for the cleanup is the same class of failure as the
+		// delete itself failing, so it is logged and the committed entry is still returned.
 		assert.Nil(err)
 		assert.Equal(expected, entry)
 	})
@@ -1387,6 +1550,29 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		assert.Equal(unitTestMaxObjectSize, recordedSize)
 	})
 
+	t.Run("surfaces an object store client acquisition failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		existing := sampleArtifact(workspace, "report-txt")
+		acquireErr := fmt.Errorf("object store client unavailable")
+
+		// Acquisition precedes the authoritative stat, so the entry keeps pointing at the
+		// content it already held - no object store or persistence expectation is set.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, acquireErr).
+			Once()
+
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), existing, stagingKeyFor(workspace), nil,
+		)
+
+		assertManagerError(assert, err, acquireErr)
+		assert.Equal(models.Artifact{}, updated)
+	})
+
 	t.Run("surfaces a stat failure", func(t *testing.T) {
 		assert := assert.New(t)
 		manager, mocks := newUnitTestManager(t)
@@ -1645,6 +1831,74 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 
 		// The entry already points at the new object by this point, so failing the call over
 		// leftover staging debris would be strictly worse than leaving it (see DESIGN §8.2.1).
+		assert.Nil(err)
+		assert.Equal(entry, updated)
+	})
+
+	t.Run("succeeds when the cleanup cannot acquire a client", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManagerCore(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "report-txt")
+		stagingObjKey := stagingKeyFor(workspace)
+		mimeType := "application/json"
+
+		// An update acquires four times - stat, sniff, copy, then the best-effort delete. The
+		// first three succeed and the last fails, so acquisition breaks only once the entry
+		// already points at its new object.
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(mocks.s3, nil).
+			Times(3)
+		mocks.s3Manager.EXPECT().
+			GetClient(mock.Anything, mock.Anything).
+			Return(nil, fmt.Errorf("object store client unavailable")).
+			Once()
+
+		mocks.s3.EXPECT().
+			GetObjectStat(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{Size: 8}, nil).
+			Once()
+		mocks.s3.EXPECT().
+			GetObject(mock.Anything, unitTestBucket, stagingObjKey).
+			Return(goutils.S3ObjectStat{}, newFakeObjectReader([]byte("contents")), nil).
+			Once()
+		mocks.callbacks.EXPECT().
+			EstimateMIMEType(mock.Anything).
+			Return(mimeType).
+			Once()
+		mocks.s3.EXPECT().
+			CopyObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything,
+			).
+			Return(nil).
+			Once()
+		// No DeleteObject expectation: without a client the delete is never attempted.
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateArtifactObject(
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+			).
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, entry.ID).
+			Return(entry, nil).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		updated, err := manager.UpdateArtifactContent(
+			context.Background(), entry, stagingObjKey, nil,
+		)
+
+		// Failing to acquire a client for the cleanup is the same class of failure as the
+		// delete itself failing, so it is logged and the updated entry is still returned.
 		assert.Nil(err)
 		assert.Equal(entry, updated)
 	})
