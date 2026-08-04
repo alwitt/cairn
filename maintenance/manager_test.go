@@ -10,16 +10,20 @@ import (
 	mockruntime "github.com/alwitt/goutils/mocks/runtime"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 // unitTestAppName the application name the harness manager is built with. It forms the prefix
 // reconciliation lists volumes on (see DESIGN §2.1), so tests assert it reaches Docker.
 const unitTestAppName = "unit-test-app"
 
+// unitTestBucket the bucket the harness manager reconciles against.
+const unitTestBucket = "unit-test-bucket"
+
 // unitTestStoreConfig a valid artifact storage config, the shape NewManager must accept.
 func unitTestStoreConfig() models.ArtifactStorageConfig {
 	return models.ArtifactStorageConfig{
-		Bucket:             "unit-test-bucket",
+		Bucket:             unitTestBucket,
 		UploadPutURLTTLSec: 300,
 		MaxObjectSizeBytes: 1024 * 1024,
 		Prefix:             models.ArtifactKeyConfig{StagingPrefix: "staging", StorePrefix: "store"},
@@ -41,6 +45,7 @@ type unitTestMocks struct {
 	database *mockdb.Database
 	volumes  *mockruntime.VolumeManager
 	s3       *mockgoutils.S3ClientManager
+	objects  *mockgoutils.S3Client
 }
 
 // newUnitTestManager build a Manager over mocked persistence, volume, and object store
@@ -53,7 +58,16 @@ func newUnitTestManager(t *testing.T) (maintenance.Manager, unitTestMocks) {
 		database: mockdb.NewDatabase(t),
 		volumes:  mockruntime.NewVolumeManager(t),
 		s3:       mockgoutils.NewS3ClientManager(t),
+		objects:  mockgoutils.NewS3Client(t),
 	}
+
+	// The manager acquires a client per object store call rather than holding one, so this is
+	// arranged unconditionally and left uncounted; a sweep that touches no object store at all
+	// simply never asks for it.
+	mocks.s3.EXPECT().
+		GetClient(mock.Anything, mock.Anything).
+		Return(mocks.objects, nil).
+		Maybe()
 
 	manager, err := maintenance.NewManager(
 		unitTestAppName,
