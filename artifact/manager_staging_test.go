@@ -38,6 +38,9 @@ const (
 	unitTestStorePrefix = "store"
 	// unitTestPutURLTTLSec the staging PUT URL TTL the harness manager is configured with
 	unitTestPutURLTTLSec = 300
+	// unitTestGetURLMaxTTLSec the download GET URL TTL ceiling the harness manager is
+	// configured with
+	unitTestGetURLMaxTTLSec = 600
 	// unitTestMaxObjectSize the single-PUT size cap the harness manager is configured with
 	unitTestMaxObjectSize int64 = 4096
 )
@@ -45,9 +48,10 @@ const (
 // unitTestStoreConfig build the storage config the harness manager is constructed with.
 func unitTestStoreConfig() models.ArtifactStorageConfig {
 	return models.ArtifactStorageConfig{
-		Bucket:             unitTestBucket,
-		UploadPutURLTTLSec: unitTestPutURLTTLSec,
-		MaxObjectSizeBytes: unitTestMaxObjectSize,
+		Bucket:                  unitTestBucket,
+		UploadPutURLTTLSec:      unitTestPutURLTTLSec,
+		DownloadGetURLMaxTTLSec: unitTestGetURLMaxTTLSec,
+		MaxObjectSizeBytes:      unitTestMaxObjectSize,
 		Prefix: models.ArtifactKeyConfig{
 			StagingPrefix: unitTestStagingPrefix,
 			StorePrefix:   unitTestStorePrefix,

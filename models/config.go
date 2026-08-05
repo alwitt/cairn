@@ -185,6 +185,11 @@ type ArtifactStorageConfig struct {
 	// UploadPutURLTTLSec number of seconds a artifact staging PUT URL is valid for
 	UploadPutURLTTLSec int `mapstructure:"putUrlTTL" json:"putUrlTTL" validate:"required,gte=5"`
 
+	// DownloadGetURLMaxTTLSec the ceiling, in seconds, on how long an artifact download GET
+	// URL is valid for. A caller may request a shorter lifetime, never a longer one; asking
+	// for nothing in particular takes this value.
+	DownloadGetURLMaxTTLSec int `mapstructure:"getUrlMaxTTL" json:"getUrlMaxTTL" validate:"required,gte=5"`
+
 	// MaxObjectSizeBytes the single-PUT size cap for an artifact's backing object.
 	// Multipart upload is out of scope for the first cut, so an object larger than this is
 	// an error rather than something to engineer around (see DESIGN §5.2).
@@ -197,6 +202,11 @@ type ArtifactStorageConfig struct {
 // UploadPutURLTTL convert UploadPutUrlTTLSec to time.Duration
 func (c ArtifactStorageConfig) UploadPutURLTTL() time.Duration {
 	return time.Second * time.Duration(c.UploadPutURLTTLSec)
+}
+
+// DownloadGetURLMaxTTL convert DownloadGetURLMaxTTLSec to time.Duration
+func (c ArtifactStorageConfig) DownloadGetURLMaxTTL() time.Duration {
+	return time.Second * time.Duration(c.DownloadGetURLMaxTTLSec)
 }
 
 // ArtifactSidecarExtraEnvVar extra ENV variable to add to a sidecar

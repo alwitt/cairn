@@ -25,13 +25,20 @@ type Manager interface {
 			@param ctx context.Context - execution context
 			@param name string - new workspace name
 			@param description *string - optionally, a description of the workspace
+			@param volumeMetadata *models.WorkspaceVolumeMetadata - optionally, provisioning
+			    parameters for the workspace's persistent volume. Recorded now and only read
+			    when the volume is actually provisioned; nil takes the deployment's defaults.
 			@param activeSession db.Database - if set, this is an existing open DB persistence
 			    layer transaction, and function will perform additional persistence operations
 			    within it.
 			@returns the new workspace entry
 	*/
 	DefineNewWorkspace(
-		ctx context.Context, name string, description *string, activeSession db.Database,
+		ctx context.Context,
+		name string,
+		description *string,
+		volumeMetadata *models.WorkspaceVolumeMetadata,
+		activeSession db.Database,
 	) (models.Workspace, error)
 
 	/*
@@ -108,6 +115,30 @@ type Manager interface {
 	*/
 	UpdateWorkspaceDescription(
 		ctx context.Context, id string, newDescription *string, activeSession db.Database,
+	) (models.Workspace, error)
+
+	/*
+		UpdateWorkspaceVolumeMeta change a workspace's persistent volume provisioning metadata.
+
+		Refused unless the workspace has no volume (`VolumeState = NONE`), which surfaces as a
+		`goutils.ConsistencyError`. The metadata only describes how to provision a volume (see
+		DESIGN §4.2), so editing it while one is live would leave the record describing
+		parameters the existing volume was never created with.
+
+			@param ctx context.Context - execution context
+			@param id string - workspace ID
+			@param newMetadata *models.WorkspaceVolumeMetadata - the new volume metadata, nil to
+			    clear it and take the deployment's default provisioning parameters
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+			@returns the workspace entry with updated volume metadata
+	*/
+	UpdateWorkspaceVolumeMeta(
+		ctx context.Context,
+		id string,
+		newMetadata *models.WorkspaceVolumeMetadata,
+		activeSession db.Database,
 	) (models.Workspace, error)
 
 	/*
@@ -282,12 +313,19 @@ provisioned separately by the operator (see DESIGN §4.2).
 	@param ctx context.Context - execution context
 	@param name string - new workspace name
 	@param description *string - optionally, a description of the workspace
+	@param volumeMetadata *models.WorkspaceVolumeMetadata - optionally, provisioning parameters
+	    for the workspace's persistent volume. Recorded now and only read when the volume is
+	    actually provisioned; nil takes the deployment's defaults.
 	@param activeSession db.Database - if set, this is an existing open DB persistence layer
 	    transaction, and function will perform additional persistence operations within it.
 	@returns the new workspace entry
 */
 func (m *managerImpl) DefineNewWorkspace(
-	ctx context.Context, name string, description *string, activeSession db.Database,
+	ctx context.Context,
+	name string,
+	description *string,
+	volumeMetadata *models.WorkspaceVolumeMetadata,
+	activeSession db.Database,
 ) (models.Workspace, error) {
 	var newEntry models.Workspace
 
@@ -295,7 +333,10 @@ func (m *managerImpl) DefineNewWorkspace(
 		ctx, activeSession, m.persistence, func(dbCtx context.Context, dbClient db.Database) error {
 			var err error
 			newEntry, err = dbClient.DefineNewWorkspace(dbCtx, db.NewWorkspaceParameter{
-				Name: name, Description: description, AppName: m.appName,
+				Name:           name,
+				Description:    description,
+				AppName:        m.appName,
+				VolumeMetadata: volumeMetadata,
 			})
 			if err != nil {
 				return goutils.NewPersistenceError(
@@ -518,6 +559,57 @@ func (m *managerImpl) UpdateWorkspaceDescription(
 	); err != nil {
 		return models.Workspace{}, models.NewWorkspaceMangerError(
 			fmt.Sprintf("failed to update workspace %s description", id), err, true,
+		)
+	}
+
+	return updated, nil
+}
+
+/*
+UpdateWorkspaceVolumeMeta change a workspace's persistent volume provisioning metadata.
+
+Refused unless the workspace has no volume (`VolumeState = NONE`), which surfaces as a
+`goutils.ConsistencyError`. The metadata only describes how to provision a volume (see DESIGN
+§4.2), so editing it while one is live would leave the record describing parameters the existing
+volume was never created with. The persistence layer holds that guard, since `VolumeState` is the
+workspace's own column.
+
+	@param ctx context.Context - execution context
+	@param id string - workspace ID
+	@param newMetadata *models.WorkspaceVolumeMetadata - the new volume metadata, nil to clear it
+	    and take the deployment's default provisioning parameters
+	@param activeSession db.Database - if set, this is an existing open DB persistence layer
+	    transaction, and function will perform additional persistence operations within it.
+	@returns the workspace entry with updated volume metadata
+*/
+func (m *managerImpl) UpdateWorkspaceVolumeMeta(
+	ctx context.Context,
+	id string,
+	newMetadata *models.WorkspaceVolumeMetadata,
+	activeSession db.Database,
+) (models.Workspace, error) {
+	var updated models.Workspace
+
+	if err := db.ActiveSessionWrapper(
+		ctx, activeSession, m.persistence, func(dbCtx context.Context, dbClient db.Database) error {
+			if err := dbClient.UpdateWorkspaceVolumeMeta(dbCtx, id, newMetadata); err != nil {
+				return goutils.NewPersistenceError(
+					fmt.Sprintf("failed to update workspace %s volume metadata", id), err, true,
+				)
+			}
+			// Re-read within the same transaction so the returned entry reflects the update.
+			var err error
+			updated, err = dbClient.GetWorkspace(dbCtx, id)
+			if err != nil {
+				return goutils.NewPersistenceError(
+					fmt.Sprintf("failed to read back updated workspace %s", id), err, true,
+				)
+			}
+			return nil
+		},
+	); err != nil {
+		return models.Workspace{}, models.NewWorkspaceMangerError(
+			fmt.Sprintf("failed to update workspace %s volume metadata", id), err, true,
 		)
 	}
 

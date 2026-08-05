@@ -281,7 +281,7 @@ func TestManagerDefineNewWorkspace(t *testing.T) {
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase))
 
-		got, err := manager.DefineNewWorkspace(utCtx, name, &description, nil)
+		got, err := manager.DefineNewWorkspace(utCtx, name, &description, nil, nil)
 		assert.Nil(err)
 		assert.Equal(created.ID, got.ID)
 		assert.Equal(name, got.Name)
@@ -289,8 +289,8 @@ func TestManagerDefineNewWorkspace(t *testing.T) {
 		assert.Equal(models.WorkspaceVolumeStateNone, got.VolumeState)
 	})
 
-	// Case 2: the optional description passes through untouched when absent.
-	t.Run("description is optional", func(t *testing.T) {
+	// Case 2: the optional description and volume metadata pass through untouched when absent.
+	t.Run("description and volume metadata are optional", func(t *testing.T) {
 		assert := assert.New(t)
 
 		manager, mockClient := newUnitTestManager(t)
@@ -299,18 +299,48 @@ func TestManagerDefineNewWorkspace(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			DefineNewWorkspace(mock.Anything, db.NewWorkspaceParameter{
-				Name: name, Description: nil, AppName: unitTestAppName,
+				Name: name, Description: nil, AppName: unitTestAppName, VolumeMetadata: nil,
 			}).
 			Return(sampleWorkspace(name), nil)
 		mockClient.EXPECT().
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase))
 
-		_, err := manager.DefineNewWorkspace(utCtx, name, nil, nil)
+		_, err := manager.DefineNewWorkspace(utCtx, name, nil, nil, nil)
 		assert.Nil(err)
 	})
 
-	// Case 3: a persistence failure surfaces wrapped, with the original error still reachable.
+	// Case 3: volume provisioning metadata reaches persistence, where it is recorded for the
+	// later volume provisioning to read (see DESIGN §4.2).
+	t.Run("volume metadata reaches persistence", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient := newUnitTestManager(t)
+		name := "unit-test-workspace"
+		sizeBytes := int64(4096)
+		metadata := models.WorkspaceVolumeMetadata{SizeBytes: &sizeBytes}
+		created := sampleWorkspaceWithVolumeSize(name, sizeBytes)
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			DefineNewWorkspace(mock.Anything, db.NewWorkspaceParameter{
+				Name:           name,
+				Description:    nil,
+				AppName:        unitTestAppName,
+				VolumeMetadata: &metadata,
+			}).
+			Return(created, nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		got, err := manager.DefineNewWorkspace(utCtx, name, nil, &metadata, nil)
+		assert.Nil(err)
+		assert.NotNil(got.VolumeMetadata)
+		assert.Equal(sizeBytes, *got.VolumeMetadata.Data().SizeBytes)
+	})
+
+	// Case 4: a persistence failure surfaces wrapped, with the original error still reachable.
 	t.Run("persistence failure is wrapped", func(t *testing.T) {
 		assert := assert.New(t)
 
@@ -325,7 +355,7 @@ func TestManagerDefineNewWorkspace(t *testing.T) {
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase))
 
-		got, err := manager.DefineNewWorkspace(utCtx, "unit-test-workspace", nil, nil)
+		got, err := manager.DefineNewWorkspace(utCtx, "unit-test-workspace", nil, nil, nil)
 		assertManagerError(assert, err, simErr)
 		assert.Empty(got.ID)
 	})
@@ -706,6 +736,94 @@ func TestManagerUpdateWorkspaceDescription(t *testing.T) {
 		var notFoundErr goutils.NotFoundError
 		assert.True(
 			errors.As(err, &notFoundErr), "expected NotFoundError, got %T: %v", err, err,
+		)
+	})
+}
+
+// TestManagerUpdateWorkspaceVolumeMeta validates volume provisioning metadata changes, including
+// clearing, and that the "volume already exists" guard is left to persistence.
+func TestManagerUpdateWorkspaceVolumeMeta(t *testing.T) {
+	log.SetLevel(log.DebugLevel)
+	utCtx := context.Background()
+
+	t.Run("returns the updated entry", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient := newUnitTestManager(t)
+		entry := sampleWorkspace("unit-test-workspace")
+		sizeBytes := int64(8192)
+		newMetadata := models.WorkspaceVolumeMetadata{SizeBytes: &sizeBytes}
+
+		updated := sampleWorkspaceWithVolumeSize(entry.Name, sizeBytes)
+		updated.ID = entry.ID
+		updated.VolumeName = entry.VolumeName
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateWorkspaceVolumeMeta(mock.Anything, entry.ID, &newMetadata).
+			Return(nil)
+		mockDatabase.EXPECT().GetWorkspace(mock.Anything, entry.ID).Return(updated, nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		got, err := manager.UpdateWorkspaceVolumeMeta(utCtx, entry.ID, &newMetadata, nil)
+		assert.Nil(err)
+		assert.NotNil(got.VolumeMetadata)
+		assert.Equal(sizeBytes, *got.VolumeMetadata.Data().SizeBytes)
+	})
+
+	// Case 2: as with the description, nil is a clear instruction rather than an absent argument
+	// - it reaches persistence as nil, returning the workspace to the deployment's defaults.
+	t.Run("nil metadata clears it", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient := newUnitTestManager(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateWorkspaceVolumeMeta(
+				mock.Anything, entry.ID, (*models.WorkspaceVolumeMetadata)(nil),
+			).
+			Return(nil)
+		mockDatabase.EXPECT().GetWorkspace(mock.Anything, entry.ID).Return(entry, nil)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		got, err := manager.UpdateWorkspaceVolumeMeta(utCtx, entry.ID, nil, nil)
+		assert.Nil(err)
+		assert.Nil(got.VolumeMetadata)
+	})
+
+	// Case 3: the metadata only describes how to provision a volume, so persistence refuses the
+	// edit once one exists (see DESIGN §4.2). The manager relays that refusal without duplicating
+	// the guard, and the ConsistencyError stays reachable so the API layer can answer 409.
+	t.Run("refusal on an existing volume is relayed", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, mockClient := newUnitTestManager(t)
+		workspaceID := uuid.NewString()
+		refused := goutils.NewConsistencyError(
+			fmt.Sprintf("workspace %s already has a persistent volume", workspaceID), nil, true,
+		)
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().
+			UpdateWorkspaceVolumeMeta(mock.Anything, workspaceID, mock.Anything).
+			Return(refused)
+		mockClient.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase))
+
+		got, err := manager.UpdateWorkspaceVolumeMeta(utCtx, workspaceID, nil, nil)
+		assertManagerError(assert, err, refused)
+		assert.Empty(got.ID)
+
+		var consistencyErr goutils.ConsistencyError
+		assert.True(
+			errors.As(err, &consistencyErr), "expected ConsistencyError, got %T: %v", err, err,
 		)
 	})
 }

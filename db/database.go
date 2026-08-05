@@ -99,6 +99,9 @@ type NewArtifactParameter struct {
 // method may assume it is already running in a transaction, and multi-statement operations
 // (e.g. a state change plus its audit event) are committed or rolled back atomically.
 type Database interface {
+	// Ready check whether the DB connection is working
+	Ready() error
+
 	// ------------------------------------------------------------------------------------
 	// Audit
 
@@ -409,6 +412,10 @@ func newDatabase(_ context.Context, sqlClient *gorm.DB) (Database, error) {
 	}
 
 	return instance, nil
+}
+
+func (c *databaseImpl) Ready() error {
+	return c.db.Find(&[]WorkspaceEntry{}).Limit(1).Error
 }
 
 // notFoundOrError translates the error returned by a single-entry fetch into a

@@ -23,3 +23,6 @@ packages:
   github.com/alwitt/cairn/artifact:
     config:
       all: true
+  github.com/alwitt/cairn/workspace:
+    config:
+      all: true

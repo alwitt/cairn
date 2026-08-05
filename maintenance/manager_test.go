@@ -23,10 +23,11 @@ const unitTestBucket = "unit-test-bucket"
 // unitTestStoreConfig a valid artifact storage config, the shape NewManager must accept.
 func unitTestStoreConfig() models.ArtifactStorageConfig {
 	return models.ArtifactStorageConfig{
-		Bucket:             unitTestBucket,
-		UploadPutURLTTLSec: 300,
-		MaxObjectSizeBytes: 1024 * 1024,
-		Prefix:             models.ArtifactKeyConfig{StagingPrefix: "staging", StorePrefix: "store"},
+		Bucket:                  unitTestBucket,
+		UploadPutURLTTLSec:      300,
+		DownloadGetURLMaxTTLSec: 600,
+		MaxObjectSizeBytes:      1024 * 1024,
+		Prefix:                  models.ArtifactKeyConfig{StagingPrefix: "staging", StorePrefix: "store"},
 	}
 }
 
