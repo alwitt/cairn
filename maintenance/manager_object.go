@@ -56,16 +56,32 @@ func (m *managerImpl) listObjectPage(
 }
 
 /*
+orphanCutoff the instant an object or entry must predate to be considered orphaned rather than
+in flight.
+
+Derived once per sweep from the timestamp handed in, rather than per decision from the wall
+clock. A full-bucket pass takes as long as it takes, and a cutoff recomputed as it went would
+judge the last page against a stricter line than the first - so whether an object survived would
+depend on where in the listing it happened to fall.
+
+	@param timestamp time.Time - the current timestamp
+	@returns the grace window's trailing edge
+*/
+func (m *managerImpl) orphanCutoff(timestamp time.Time) time.Time {
+	return timestamp.Add(-m.maintenanceConfig.OrphanedObjectAgeOut())
+}
+
+/*
 objectAgedOut report whether an object has sat unassociated long enough to be reclaimed.
 
 The age comes from the listing that produced the object, so there is no round trip here and no
 way for the question to fail - which is what lets a whole sweep cost one call per page.
 
+	@param cutoff time.Time - the grace window's trailing edge, from orphanCutoff
 	@param object goutils.S3ObjectStat - the object to age, as the listing reported it
 	@returns whether the object is old enough to reclaim
 */
-func (m *managerImpl) objectAgedOut(object goutils.S3ObjectStat) bool {
-	cutoff := time.Now().UTC().Add(-m.maintenanceConfig.OrphanedObjectAgeOut())
+func objectAgedOut(cutoff time.Time, object goutils.S3ObjectStat) bool {
 	return object.LastModified.Before(cutoff)
 }
 
@@ -137,17 +153,20 @@ registration takes, or a slow upload is reclaimed out from under itself. The two
 independent and nothing checks the relationship between them.
 
 	@param ctx context.Context - execution context
+	@param timestamp time.Time - the current timestamp, which the grace window is measured back
+	    from
 	@param workspaceID *string - optionally, confine the sweep to one workspace's staging key
 	    namespace; nil sweeps every workspace's
 	@returns what the sweep observed and reclaimed
 */
 func (m *managerImpl) DeleteOrphanedStagingObjects(
-	ctx context.Context, workspaceID *string,
+	ctx context.Context, timestamp time.Time, workspaceID *string,
 ) (StagingReapReport, error) {
 	logTags := m.GetLogTagsForContext(ctx)
 
 	var report StagingReapReport
 
+	cutoff := m.orphanCutoff(timestamp)
 	prefix := m.stagingKeyPrefix(workspaceID)
 
 	var failures []error
@@ -167,7 +186,7 @@ func (m *managerImpl) DeleteOrphanedStagingObjects(
 
 		var reclaim []string
 		for _, object := range objects {
-			if !m.objectAgedOut(object) {
+			if !objectAgedOut(cutoff, object) {
 				report.Retained++
 				continue
 			}
@@ -215,16 +234,23 @@ Both directions fall out of one pass over the entries, which is why they are not
 - asking the same question twice would scan the store twice to learn the same thing.
 
 	@param ctx context.Context - execution context
+	@param timestamp time.Time - the current timestamp, which the grace window is measured back
+	    from
 	@param workspaceID *string - optionally, confine the reconciliation to one workspace's
 	    entries and storage key namespace; nil reconciles every workspace's
 	@returns what the reconciliation observed, reclaimed, and flagged
 */
 func (m *managerImpl) ReconcileStorageObjects(
-	ctx context.Context, workspaceID *string,
+	ctx context.Context, timestamp time.Time, workspaceID *string,
 ) (StorageReconcileReport, error) {
 	logTags := m.GetLogTagsForContext(ctx)
 
 	var report StorageReconcileReport
+
+	// One cutoff for both directions. The reclamations and the quarantines are two readings of
+	// the same grace window (see DESIGN §8.2.1 item 3), so they must not be able to disagree
+	// about where it falls.
+	cutoff := m.orphanCutoff(timestamp)
 
 	// Read the entries BEFORE listing the store, and the ordering is load-bearing. An entry is
 	// only ever inserted AFTER its object copy completes (see DESIGN §6.1), so an entry read
@@ -286,7 +312,7 @@ func (m *managerImpl) ReconcileStorageObjects(
 
 			// The join happening here, as the deletion is decided, IS the re-validation DESIGN
 			// §8.3.1 asks for: a key goes only because it is STILL unclaimed on this pass.
-			if !m.objectAgedOut(object) {
+			if !objectAgedOut(cutoff, object) {
 				report.Retained++
 				continue
 			}
@@ -304,7 +330,7 @@ func (m *managerImpl) ReconcileStorageObjects(
 		startAfter = &objects[len(objects)-1].Key
 	}
 
-	flagged, flagFailures := m.quarantineUnbackedArtifacts(ctx, unobserved)
+	flagged, flagFailures := m.quarantineUnbackedArtifacts(ctx, cutoff, unobserved)
 	report.FlaggedMissing = flagged
 	failures = append(failures, flagFailures...)
 
@@ -365,20 +391,20 @@ quarantineUnbackedArtifacts flag the artifact entries the store had no object fo
 Each flag is its own transaction so one entry's failure can't roll back another's, and so the
 state write stays atomic with the audit event persistence records alongside it.
 
+Held to the same grace window the deletions use, per DESIGN §8.2.1 item 3. An entry written
+moments ago is still in flux - its object may be landing as this runs - and quarantine is an
+incident report, not a retryable correction. Only a settled entry makes a claim worth publishing.
+
 	@param ctx context.Context - execution context
+	@param cutoff time.Time - the grace window's trailing edge, the same one the reclamations
+	    were gated on
 	@param unobserved map[string]models.Artifact - the `RECORDED` entries the store never showed
 	@returns the IDs of the entries quarantined
 */
 func (m *managerImpl) quarantineUnbackedArtifacts(
-	ctx context.Context, unobserved map[string]models.Artifact,
+	ctx context.Context, cutoff time.Time, unobserved map[string]models.Artifact,
 ) ([]string, []error) {
 	logTags := m.GetLogTagsForContext(ctx)
-
-	// Hold the quarantine to the same grace window the deletions use, per DESIGN §8.2.1 item 3.
-	// An entry written moments ago is still in flux - its object may be landing as this runs -
-	// and quarantine is an incident report, not a retryable correction. Only a settled entry
-	// makes a claim worth publishing.
-	cutoff := time.Now().UTC().Add(-m.maintenanceConfig.OrphanedObjectAgeOut())
 
 	var flagged []string
 	var failures []error

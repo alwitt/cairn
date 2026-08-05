@@ -30,6 +30,14 @@ const agedOut = 2 * time.Hour
 // stillFresh an age comfortably inside the harness grace window.
 const stillFresh = 5 * time.Minute
 
+// unitTestSweepTime the instant every sweep in this file is run at, and the one every age below
+// is measured back from.
+//
+// Fixed rather than read from the clock, which is the property the sweeps now take a timestamp
+// for: an object's fate must not depend on how long the pass that examined it had been running.
+// Held far enough in the past that nothing here can be mistaken for a time yet to come.
+var unitTestSweepTime = time.Date(2026, time.March, 14, 9, 26, 53, 0, time.UTC)
+
 // listedObject an object as the store's listing reports it - a key, and how long ago it was
 // last written.
 type listedObject struct {
@@ -58,7 +66,7 @@ func expectObjectPage(
 			Key: object.key,
 			// A listing reports neither MIMEType nor CheckSum, so they are deliberately left
 			// zero here - a sweep must not come to depend on either.
-			LastModified: time.Now().UTC().Add(-object.age),
+			LastModified: unitTestSweepTime.Add(-object.age),
 		})
 	}
 
@@ -97,7 +105,7 @@ func sampleArtifact(
 		Name:        "artifact-" + objectKey,
 		ObjectKey:   objectKey,
 		State:       state,
-		UpdatedAt:   time.Now().UTC().Add(-settledFor),
+		UpdatedAt:   unitTestSweepTime.Add(-settledFor),
 	}
 }
 
@@ -127,7 +135,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 		)
 		expectObjectDelete(mocks, "staging/ws/old")
 
-		report, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		report, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(2, report.Examined)
 		assert.Equal(1, report.Deleted)
@@ -148,7 +156,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 		expectObjectPage(mocks, "staging/", firstPage, aged("staging/ws/old", agedOut))
 		expectObjectDelete(mocks, "staging/ws/old")
 
-		_, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		_, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 	})
 
@@ -162,7 +170,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 
 		expectObjectPage(mocks, "staging/", firstPage)
 
-		report, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		report, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(0, report.Examined)
 	})
@@ -177,7 +185,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 
 		expectObjectPage(mocks, fmt.Sprintf("staging/%s/", workspaceID), firstPage)
 
-		_, err := manager.DeleteOrphanedStagingObjects(utCtx, &workspaceID)
+		_, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, &workspaceID)
 		assert.Nil(err)
 	})
 
@@ -202,7 +210,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 		expectObjectPage(mocks, "staging/", firstPage, fullPage...)
 		expectObjectPage(mocks, "staging/", &lastKey, aged("staging/ws/tail", stillFresh))
 
-		report, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		report, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(unitTestListPageSize+1, report.Examined)
 		assert.Equal(0, report.Deleted)
@@ -223,7 +231,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 			Return(nil, listFailure).
 			Once()
 
-		report, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		report, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.NotNil(err)
 		assert.ErrorIs(err, listFailure)
 		assert.Equal(0, report.Examined)
@@ -248,7 +256,7 @@ func TestDeleteOrphanedStagingObjects(t *testing.T) {
 			Return(map[string]error{"staging/ws/b": deleteFailure}, nil).
 			Once()
 
-		report, err := manager.DeleteOrphanedStagingObjects(utCtx, nil)
+		report, err := manager.DeleteOrphanedStagingObjects(utCtx, unitTestSweepTime, nil)
 		assert.NotNil(err)
 		assert.ErrorIs(err, deleteFailure)
 		assert.Equal(1, report.Deleted)
@@ -281,7 +289,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectObjectPage(mocks, "store/", firstPage, aged("store/ws/purged", agedOut))
 		expectObjectDelete(mocks, "store/ws/purged")
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(1, report.Examined)
 		assert.Equal(1, report.Deleted)
@@ -303,7 +311,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, nil, []models.Artifact{})
 		expectObjectPage(mocks, "store/", firstPage, aged("store/ws/inflight", stillFresh))
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(1, report.Retained)
 		assert.Equal(0, report.Deleted)
@@ -322,7 +330,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, nil, []models.Artifact{entry})
 		expectObjectPage(mocks, "store/", firstPage, aged(entry.ObjectKey, agedOut))
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(1, report.Examined)
 		assert.Equal(0, report.Deleted)
@@ -342,7 +350,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, nil, []models.Artifact{entry})
 		expectObjectPage(mocks, "store/", firstPage, aged(entry.ObjectKey, agedOut))
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(0, report.Deleted)
 	})
@@ -364,7 +372,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			Return(nil).
 			Once()
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal([]string{entry.ID}, report.FlaggedMissing)
 	})
@@ -385,7 +393,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, nil, []models.Artifact{entry})
 		expectObjectPage(mocks, "store/", firstPage)
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Empty(report.FlaggedMissing)
 	})
@@ -403,7 +411,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, nil, []models.Artifact{entry})
 		expectObjectPage(mocks, "store/", firstPage)
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Empty(report.FlaggedMissing)
 	})
@@ -443,7 +451,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			).
 			Once()
 
-		_, err := manager.ReconcileStorageObjects(utCtx, nil)
+		_, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal([]string{"entries", "objects"}, order)
 	})
@@ -463,7 +471,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			Return(nil, dbFailure).
 			Once()
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.NotNil(err)
 		assert.ErrorIs(err, dbFailure)
 		assert.Equal(0, report.Examined)
@@ -492,7 +500,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			Return(nil).
 			Once()
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.NotNil(err)
 		assert.ErrorIs(err, writeFailure)
 		assert.Equal([]string{healthy.ID}, report.FlaggedMissing)
@@ -516,7 +524,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			Return(goutils.NewNotFoundError("artifact does not exist", nil, true)).
 			Once()
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Empty(report.FlaggedMissing)
 	})
@@ -545,7 +553,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 			Return(nil).
 			Once()
 
-		report, err := manager.ReconcileStorageObjects(utCtx, nil)
+		report, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, nil)
 		assert.Nil(err)
 		assert.Equal(2, report.Examined)
 		assert.Equal(1, report.Deleted)
@@ -569,7 +577,7 @@ func TestReconcileStorageObjects(t *testing.T) {
 		expectArtifactListing(mocks, &workspaceID, []models.Artifact{})
 		expectObjectPage(mocks, fmt.Sprintf("store/%s/", workspaceID), firstPage)
 
-		_, err := manager.ReconcileStorageObjects(utCtx, &workspaceID)
+		_, err := manager.ReconcileStorageObjects(utCtx, unitTestSweepTime, &workspaceID)
 		assert.Nil(err)
 	})
 }

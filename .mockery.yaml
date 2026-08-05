@@ -14,6 +14,9 @@ packages:
   github.com/alwitt/cairn/db:
     config:
       all: true
+  github.com/alwitt/cairn/maintenance:
+    config:
+      all: true
   github.com/alwitt/cairn/test:
     config:
       all: true

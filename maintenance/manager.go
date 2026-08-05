@@ -121,12 +121,15 @@ type Manager interface {
 		the relationship between them.
 
 			@param ctx context.Context - execution context
+			@param timestamp time.Time - the current timestamp, which the grace window is
+			    measured back from. Taken rather than read so one instant judges every object
+			    the sweep sees, however long the sweep runs for.
 			@param workspaceID *string - optionally, confine the sweep to one workspace's
 			    staging key namespace; nil sweeps every workspace's
 			@returns what the sweep observed and reclaimed
 	*/
 	DeleteOrphanedStagingObjects(
-		ctx context.Context, workspaceID *string,
+		ctx context.Context, timestamp time.Time, workspaceID *string,
 	) (StagingReapReport, error)
 
 	/*
@@ -156,12 +159,15 @@ type Manager interface {
 		when the error is non-nil.
 
 			@param ctx context.Context - execution context
+			@param timestamp time.Time - the current timestamp, which the grace window is
+			    measured back from. Taken rather than read so one instant gates both the
+			    reclamations and the quarantines, however long the reconciliation runs for.
 			@param workspaceID *string - optionally, confine the reconciliation to one
 			    workspace's entries and storage key namespace; nil reconciles every workspace's
 			@returns what the reconciliation observed, reclaimed, and flagged
 	*/
 	ReconcileStorageObjects(
-		ctx context.Context, workspaceID *string,
+		ctx context.Context, timestamp time.Time, workspaceID *string,
 	) (StorageReconcileReport, error)
 }
 
