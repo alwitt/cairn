@@ -52,6 +52,9 @@ type serverImpl struct {
 	// workspaceMgr workspace manager
 	workspaceMgr workspace.Manager
 
+	// volume persistent volume manager
+	volume runtime.VolumeManager
+
 	// artifactMgr artifact manager
 	artifactMgr artifact.Manager
 
@@ -75,7 +78,11 @@ Start the server and its components
 		failure (e.g. one of the HTTP servers failing on ListenAndServe) back to
 		the caller so it can trigger shutdown
 */
-func (s *serverImpl) Start(_ context.Context, serverErrors chan error) error {
+func (s *serverImpl) Start(ctx context.Context, serverErrors chan error) error {
+	if err := s.volume.Start(ctx); err != nil {
+		return models.NewBootStrapError("Failed to start persistent volume manager", err, true)
+	}
+
 	// Start API server
 	s.wg.Add(1)
 	go func() {
@@ -122,6 +129,8 @@ func (s *serverImpl) Stop(ctx context.Context) error {
 	metricsErr := s.metricsServer.Shutdown(lclCtx)
 	// Wait for all threads to stop
 	waitErr := goutils.TimeBoundedWaitGroupWait(lclCtx, &s.wg, time.Second*5)
+	// Stop the volume manager
+	volumeMgrStopErr := s.volume.Cleanup(ctx)
 
 	allErrors := []error{}
 	if mainErr != nil {
@@ -137,6 +146,11 @@ func (s *serverImpl) Stop(ctx context.Context) error {
 	if waitErr != nil {
 		allErrors = append(
 			allErrors, models.NewShutdownError("Daemon tasks did not stop in time", waitErr, true),
+		)
+	}
+	if volumeMgrStopErr != nil {
+		allErrors = append(
+			allErrors, models.NewShutdownError("Failed to stop volume manager", volumeMgrStopErr, true),
 		)
 	}
 
@@ -280,6 +294,7 @@ func BuildNewServer(parentCtx context.Context, configs models.ApplicationConfig)
 		parentCtx:        parentCtx,
 		persistence:      persistence,
 		workspaceMgr:     workspaceMgr,
+		volume:           volume,
 		artifactMgr:      artifactMgr,
 		artifactOperator: artifactOperator,
 		mainServer:       apiServer,

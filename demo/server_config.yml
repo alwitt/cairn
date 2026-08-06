@@ -1,5 +1,5 @@
 ---
-appName: local-dev
+appName: cairn-local-dev
 
 persistence:
   sql:
