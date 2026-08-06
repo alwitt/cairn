@@ -57,12 +57,35 @@ type EndpointConfig struct {
 	PathPrefix string `mapstructure:"pathPrefix" json:"pathPrefix" validate:"required"`
 }
 
+// MCPAPIConfig defines the agent facing MCP endpoint's settings
+type MCPAPIConfig struct {
+	// Enable whether to serve the MCP endpoint. The REST surface is unaffected either way, so
+	// this turns the agent facing door off without taking the operator's away.
+	Enable bool `mapstructure:"enable" json:"enable"`
+
+	// EnableDNSRebindGuard whether to keep the MCP SDK's DNS rebinding protection, which
+	// refuses a request that arrives over a loopback connection carrying a `Host` header that
+	// is not itself a loopback address.
+	//
+	// It keys off the server's own connection address rather than its listen address, so a
+	// same host reverse proxy dialing `127.0.0.1` trips it even when this service listens on
+	// `0.0.0.0`. Such a deployment either reaches the service over a non-loopback address or
+	// turns the guard off, having already placed ingress with the proxy (see DESIGN §2.4).
+	EnableDNSRebindGuard bool `mapstructure:"enableDNSRebindGuard" json:"enableDNSRebindGuard"`
+}
+
 // APIConfig defines API settings for a submodule
 type APIConfig struct {
 	// Endpoint sets API endpoint related parameters
 	Endpoint EndpointConfig `mapstructure:"endPoint" json:"endPoint" validate:"required"`
 	// RequestLogging sets API request logging parameters
 	RequestLogging HTTPRequestLogging `mapstructure:"requestLogging" json:"requestLogging" validate:"required"`
+	// MCP sets the MCP endpoint's parameters
+	//
+	// Deliberately not `required`: that means "not the zero value", and an MCPAPIConfig with
+	// both flags false is the zero value - which is the ordinary MCP disabled case, not an
+	// invalid one.
+	MCP MCPAPIConfig `mapstructure:"mcp" json:"mcp"`
 }
 
 // APIServerConfig defines HTTP API / server parameters

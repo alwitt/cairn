@@ -12,6 +12,7 @@ import (
 	"github.com/alwitt/cairn/workspace"
 	"github.com/alwitt/goutils"
 	"github.com/gorilla/mux"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rs/cors"
 )
 
@@ -252,6 +253,45 @@ func BuildHTTPServer(
 			},
 		),
 	)
+
+	// --------------------------------------------------------------------------------
+	// MCP endpoint
+	//
+	// The agent facing surface (see DESIGN §7.2). It carries its own receiving middleware
+	// rather than being wrapped by the REST handlers' - the two log under different tags, and
+	// `/v1` installs no router level `Use` precisely so this route picks up only its own.
+
+	if httpCfg.APIs.MCP.Enable {
+		mcpAPI, err := NewMCPHandler(
+			appName, workspaces, artifacts, artifactOps, httpCfg.APIs.RequestLogging,
+		)
+		if err != nil {
+			return nil, goutils.NewRuntimeError("failed to define MCP API handler", err, true)
+		}
+
+		mcpServer := mcp.NewServer(
+			&mcp.Implementation{Name: mcpServerName, Version: mcpServerVersion},
+			&mcp.ServerOptions{Instructions: mcpServerInstructions},
+		)
+		if err := mcpAPI.RegisterTools(mcpServer); err != nil {
+			return nil, goutils.NewRuntimeError("failed to register MCP tools", err, true)
+		}
+
+		mcpServer.AddReceivingMiddleware(mcpAPI.LoggingMiddleware)
+
+		_ = v1Router.Path("/mcp").Handler(mcp.NewStreamableHTTPHandler(
+			func(_ *http.Request) *mcp.Server { return mcpServer },
+			&mcp.StreamableHTTPOptions{
+				// Every tool is synchronous request/response and none needs to ask the client
+				// anything, which is all a stateless session gives up. In exchange the endpoint
+				// holds no per client state, so any replica behind the proxy can serve any
+				// request.
+				Stateless: true,
+				// The SDK spells this one as the negative, so the config's positive inverts.
+				DisableLocalhostProtection: !httpCfg.APIs.MCP.EnableDNSRebindGuard,
+			},
+		))
+	}
 
 	// --------------------------------------------------------------------------------
 	// Middleware

@@ -214,6 +214,15 @@ control live — that is not this service's job.
   **inter-service communication**, explicitly **not** covered by authn/authz here.
 - This is orthogonal to §5's *sidecar* trust posture, which is about credential
   containment in transfer containers, not caller identity.
+- **The MCP endpoint carries one optional guard of its own**
+  (`api.apis.mcp.enableDNSRebindGuard`): the MCP SDK's DNS-rebinding protection,
+  which refuses a request arriving over a **loopback connection** whose `Host` header
+  is not itself loopback. It keys off the server's own *connection* address rather
+  than its listen address, so a same-host reverse proxy dialing `127.0.0.1` trips it
+  even when cairn listens on `0.0.0.0`. Such a deployment either reaches cairn over a
+  non-loopback address or turns the guard off, having already placed ingress with the
+  proxy. REST is unaffected, so the symptom is **MCP-only 403s** that look like proxy
+  misconfiguration.
 
 ---
 
@@ -657,7 +666,7 @@ uses.
 | `delete_artifact` | **Deletes the artifact row** (from `RECORDED` or `MISSING_OBJECT`); the object is reclaimed later by the GC (§8.2.1). Idempotent. |
 | `rename_artifact` | Updates an artifact's name (pure DB update). |
 | `list_workspaces` | Read-only. Lists workspaces the agent can use. |
-| `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether the volume is ready to mount) plus the **estimated number of containers currently mounting** the workspace volume (Docker `RefCount`, §4.3). |
+| `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether the volume is ready to mount). Deliberately **not** the mount count the REST fetch returns (§7.1): an agent never tears a volume down — that is the operator's job — so the count is a number it could do nothing with. |
 
 ### 7.3 Synchronous MCP model — call the core function directly (no self-REST hop)
 An MCP tool call is **synchronous and server-orchestrated**: the service launches
