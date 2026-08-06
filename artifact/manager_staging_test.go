@@ -48,10 +48,10 @@ const (
 // unitTestStoreConfig build the storage config the harness manager is constructed with.
 func unitTestStoreConfig() models.ArtifactStorageConfig {
 	return models.ArtifactStorageConfig{
-		Bucket:                  unitTestBucket,
-		UploadPutURLTTLSec:      unitTestPutURLTTLSec,
-		DownloadGetURLMaxTTLSec: unitTestGetURLMaxTTLSec,
-		MaxObjectSizeBytes:      unitTestMaxObjectSize,
+		Bucket:                   unitTestBucket,
+		UploadPutURLTTLSecs:      unitTestPutURLTTLSec,
+		DownloadGetURLMaxTTLSecs: unitTestGetURLMaxTTLSec,
+		MaxObjectSizeBytes:       unitTestMaxObjectSize,
 		Prefix: models.ArtifactKeyConfig{
 			StagingPrefix: unitTestStagingPrefix,
 			StorePrefix:   unitTestStorePrefix,

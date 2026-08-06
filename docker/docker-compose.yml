@@ -1,0 +1,128 @@
+services:
+
+  cairn-app-db:
+    container_name: cairn-app-db
+    restart: always
+    hostname: "cairn-app-postgres"
+    image: "postgres:18"
+    ports:
+      - 127.0.0.1:6532:5432
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=cairn
+      - POSTGRES_PASSWORD=cairn
+    networks:
+      - cairn_dev
+
+  cairn-redis:
+    container_name: cairn-redis
+    restart: unless-stopped
+    hostname: redis
+    image: "redis:8.8-alpine"
+    command:
+      - redis-server
+      - --save 60 1
+      - --loglevel warning
+    ports:
+      - 127.0.0.1:3379:6379
+    networks:
+      - cairn_dev
+
+  cairn-rustfs:
+    container_name: cairn-rustfs
+    restart: unless-stopped
+    hostname: rustfs
+    image: rustfs/rustfs:latest
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "127.0.0.1:9100:9000" # S3 API port
+      - "127.0.0.1:9101:9001" # Console port
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=admin # CHANGEME
+      - RUSTFS_SECRET_KEY=password # CHANGEME
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      # Optional TLS:
+      # - mount your cert directory to /opt/tls
+      # - set RUSTFS_TLS_PATH=/opt/tls
+      # - when TLS is enabled, health checks automatically switch to HTTPS
+      # Keep strict disk topology checks enabled by default.
+      # For local testing only, set `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` explicitly.
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+
+    volumes:
+      - cairn_rustfs_data_0:/data/rustfs0
+      - cairn_rustfs_data_1:/data/rustfs1
+      - cairn_rustfs_data_2:/data/rustfs2
+      - cairn_rustfs_data_3:/data/rustfs3
+      - cairn_rustfs_logs:/app/logs
+    networks:
+      - cairn_dev
+    healthcheck:
+      # Default behavior:
+      # - HTTP when RUSTFS_TLS_PATH is unset
+      # - HTTPS when RUSTFS_TLS_PATH is set
+      # - loopback TLS uses `-k` unless strict host+CA values are provided
+      #
+      # Strict TLS example:
+      # - set RUSTFS_HEALTHCHECK_HOST to a SAN-covered hostname
+      # - optionally set RUSTFS_HEALTHCHECK_CA (defaults to /opt/tls/ca.crt when present)
+      test:
+        [
+          "CMD",
+          "sh", "-ec",
+          "host=\"$${RUSTFS_HEALTHCHECK_HOST:-127.0.0.1}\"; scheme=\"http\"; set -- -fsS; \
+          if [ -n \"$${RUSTFS_TLS_PATH:-}\" ]; then \
+            scheme=\"https\"; \
+            ca_path=\"$${RUSTFS_HEALTHCHECK_CA:-}\"; \
+            if [ -z \"$${ca_path}\" ] && [ -f /opt/tls/ca.crt ]; then ca_path=/opt/tls/ca.crt; fi; \
+            case \"$${host}\" in 127.0.0.1|localhost) strict_host=false ;; *) strict_host=true ;; esac; \
+            if [ \"$${strict_host}\" = true ] && [ -n \"$${ca_path}\" ]; then \
+              set -- \"$${@}\" --cacert \"$${ca_path}\" --resolve \"$${host}:9000:127.0.0.1\" --resolve \"$${host}:9001:127.0.0.1\"; \
+            else \
+              set -- \"$${@}\" -k; \
+            fi; \
+          fi; \
+          curl \"$${@}\" \"$${scheme}://$${host}:9000/health\" && \
+          curl \"$${@}\" \"$${scheme}://$${host}:9001/rustfs/console/health\""
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # RustFS volume permissions fixer service
+  cairn-rustfs-volume-permission-helper:
+    image: alpine
+    volumes:
+      - cairn_rustfs_data_0:/data0
+      - cairn_rustfs_data_1:/data1
+      - cairn_rustfs_data_2:/data2
+      - cairn_rustfs_data_3:/data3
+      - cairn_rustfs_logs:/logs
+    command: >
+      sh -c "
+        chown -R 10001:10001 /data0 /data1 /data2 /data3 /logs &&
+        echo 'Volume Permissions fixed' &&
+        exit 0
+      "
+    # Permission baseline:
+    # - default RustFS runtime user is 10001:10001
+    # - alternatively, run rustfs service with host-matched `user: \"<uid>:<gid>\"`
+    restart: "no"
+
+networks:
+  cairn_dev:
+    name: cairn-dev
+
+volumes:
+  cairn_rustfs_data_0:
+  cairn_rustfs_data_1:
+  cairn_rustfs_data_2:
+  cairn_rustfs_data_3:
+  cairn_rustfs_logs:

@@ -1,0 +1,53 @@
+---
+appName: local-dev
+
+persistence:
+  sql:
+    # Main server SQL persistence config, password provided separately
+    app:
+      debugLog: false
+      host: 127.0.0.1
+      port: 6532
+      db: postgres
+      user: cairn
+
+metrics:
+  service:
+    listenOn: 127.0.0.1
+    appPort: 3101
+
+api:
+  apis:
+    requestLogging:
+      logLevel: warn
+      healthLogLevel: debug
+      logRequestPayload: false
+    mcp:
+      enable: true
+      enableDNSRebindGuard: true
+  service:
+    listenOn: 127.0.0.1
+    appPort: 44123
+
+workspace:
+  volumeType: docker
+
+artifact:
+  s3:
+    clientTTL: 1800
+    endpoint: 127.0.0.1:9100
+    useTLS: false
+
+  store:
+    bucket: cairn-dev
+    putUrlTTLSecs: 900
+    getUrlMaxTTLSecs: 90
+    prefix:
+      base: poc
+      staging: staging
+      store: store
+
+  sidecar:
+    image: alwitt/cairn-sidecar:latest
+    timeoutSecs: 120
+    networkMode: bridge

@@ -203,7 +203,7 @@ type dockerOperatorImpl struct {
 }
 
 /*
-NewOperator define a new docker driven artifact operator
+NewDockerOperator define a new docker driven artifact operator
 
 	@param appName string - the per-deployment application name
 	@param manager Manager - the core artifact manager the operations are built on
@@ -212,7 +212,7 @@ NewOperator define a new docker driven artifact operator
 	    sidecar runs in. Pass `DefaultSystemCallDockerRuntimeFactory` outside of tests.
 	@returns the new artifact operator
 */
-func NewOperator(
+func NewDockerOperator(
 	appName string,
 	manager Manager,
 	sidecarConfig models.ArtifactSidecarConfig,

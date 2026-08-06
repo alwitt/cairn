@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/alwitt/goutils"
+	"github.com/spf13/viper"
 )
 
 // ======================================================================================
@@ -119,6 +120,47 @@ type MetricsConfig struct {
 	Features MetricsFeatureConfig `mapstructure:"features" json:"features" validate:"required"`
 }
 
+// ===============================================================================
+// Persistence Configuration Structures
+
+// PostgresSSLConfig Postgres connection SSL config
+type PostgresSSLConfig struct {
+	// Enabled whether to enable SSL when connecting to Postgres
+	Enabled bool `mapstructure:"enabled" json:"enabled"`
+	// CAFile the CA cert file to challenge remote with
+	CAFile *string `mapstructure:"caFile" json:"caFile,omitempty" validate:"omitempty,file"`
+}
+
+// PostgresConfig Postgres connection config
+type PostgresConfig struct {
+	// DebugLog whether to output ORM layer debug logs
+	DebugLog bool `mapstructure:"debugLog" json:"debugLog"`
+	// Host Postgres server host
+	Host string `mapstructure:"host" json:"host" validate:"required"`
+	// Port Postgres server port
+	Port uint16 `mapstructure:"port" json:"port" validate:"lte=65535,gte=0"`
+	// Database the specific database to use
+	Database string `mapstructure:"db" json:"db" validate:"required"`
+	// User the user to connect with
+	User string `mapstructure:"user" json:"user" validate:"required"`
+	// Password the user password
+	Password *string `json:"-" validate:"-"`
+	// SSL the connection SSL settings
+	SSL PostgresSSLConfig `mapstructure:"ssl" json:"ssl" validate:"required"`
+}
+
+// SQLPersistenceConfig system SQL persistence config
+type SQLPersistenceConfig struct {
+	// Application SQL persistence config
+	Application PostgresConfig `mapstructure:"app" json:"app" validate:"required"`
+}
+
+// PersistenceConfig application persistence config
+type PersistenceConfig struct {
+	// SQL persistence config
+	SQL SQLPersistenceConfig `mapstructure:"sql" json:"sql" validate:"required"`
+}
+
 // ======================================================================================
 // Workspace Config
 
@@ -134,14 +176,34 @@ type WorkspaceManagerConfig struct {
 
 // ObjectStoreConfig object store config
 type ObjectStoreConfig struct {
+	// ClientTTLSec S3 client TTL. This is provided to the S3 client manager to periodically
+	// refresh the S3 client in use.
+	ClientTTLSec int `mapstructure:"clientTTL" json:"clientTTL" validate:"required,gte=60"`
 	// ServerEndpoint S3 server endpoint
 	ServerEndpoint string `mapstructure:"endpoint" json:"endpoint" validate:"required"`
+	// Region optional S3 region. When set, it is used as the client region (which,
+	// among other things, is the region newly created buckets are placed in). When
+	// nil, the region is left for the server / minio to resolve automatically.
+	Region *string `mapstructure:"region,omitempty" json:"region,omitempty" validate:"omitempty"`
 	// UseTLS whether to TLS when connecting
 	UseTLS bool `mapstructure:"useTLS" json:"useTLS"`
-	// AccessKey object store access key
-	AccessKey string `mapstructure:"accessID" json:"accessID" validate:"required"`
-	// SecretAccessKey object store secret access key
-	SecretAccessKey string `mapstructure:"secretID" json:"secretID" validate:"required"`
+	// Creds object store credentials
+	Creds goutils.S3Credentials `validate:"required"`
+}
+
+// ClientTTL convert `ClientTTLSec` to time.Duration
+func (c ObjectStoreConfig) ClientTTL() time.Duration {
+	return time.Second * time.Duration(c.ClientTTLSec)
+}
+
+// ToStandard convert to goutils.S3Config
+func (c ObjectStoreConfig) ToStandard() goutils.S3Config {
+	return goutils.S3Config{
+		ServerEndpoint: c.ServerEndpoint,
+		UseTLS:         c.UseTLS,
+		Region:         c.Region,
+		Creds:          c.Creds,
+	}
 }
 
 // ArtifactKeyConfig artifact object key configs
@@ -205,13 +267,13 @@ type ArtifactStorageConfig struct {
 	// Bucket to store all artifact and staging objects in
 	Bucket string `mapstructure:"bucket" json:"bucket" validate:"required"`
 
-	// UploadPutURLTTLSec number of seconds a artifact staging PUT URL is valid for
-	UploadPutURLTTLSec int `mapstructure:"putUrlTTL" json:"putUrlTTL" validate:"required,gte=5"`
+	// UploadPutURLTTLSecs number of seconds a artifact staging PUT URL is valid for
+	UploadPutURLTTLSecs int `mapstructure:"putUrlTTLSecs" json:"putUrlTTLSecs" validate:"required,gte=5"`
 
-	// DownloadGetURLMaxTTLSec the ceiling, in seconds, on how long an artifact download GET
+	// DownloadGetURLMaxTTLSecs the ceiling, in seconds, on how long an artifact download GET
 	// URL is valid for. A caller may request a shorter lifetime, never a longer one; asking
 	// for nothing in particular takes this value.
-	DownloadGetURLMaxTTLSec int `mapstructure:"getUrlMaxTTL" json:"getUrlMaxTTL" validate:"required,gte=5"`
+	DownloadGetURLMaxTTLSecs int `mapstructure:"getUrlMaxTTLSecs" json:"getUrlMaxTTLSecs" validate:"required,gte=5"`
 
 	// MaxObjectSizeBytes the single-PUT size cap for an artifact's backing object.
 	// Multipart upload is out of scope for the first cut, so an object larger than this is
@@ -224,12 +286,12 @@ type ArtifactStorageConfig struct {
 
 // UploadPutURLTTL convert UploadPutUrlTTLSec to time.Duration
 func (c ArtifactStorageConfig) UploadPutURLTTL() time.Duration {
-	return time.Second * time.Duration(c.UploadPutURLTTLSec)
+	return time.Second * time.Duration(c.UploadPutURLTTLSecs)
 }
 
 // DownloadGetURLMaxTTL convert DownloadGetURLMaxTTLSec to time.Duration
 func (c ArtifactStorageConfig) DownloadGetURLMaxTTL() time.Duration {
-	return time.Second * time.Duration(c.DownloadGetURLMaxTTLSec)
+	return time.Second * time.Duration(c.DownloadGetURLMaxTTLSecs)
 }
 
 // ArtifactSidecarExtraEnvVar extra ENV variable to add to a sidecar
@@ -333,6 +395,9 @@ type ApplicationConfig struct {
 	// AppName application name which is used to construct workspace persistent volume manages
 	AppName string `mapstructure:"appName" json:"appName" validate:"required,valid_name"`
 
+	// Persistence system persistence config
+	Persistence PersistenceConfig `mapstructure:"persistence" json:"persistence" validate:"required"`
+
 	// Metrics metrics framework configuration
 	Metrics MetricsConfig `mapstructure:"metrics" json:"metrics" validate:"required"`
 
@@ -347,4 +412,140 @@ type ApplicationConfig struct {
 
 	// Maintenance maintenance system configuration
 	Maintenance MaintenanceConfig `mapstructure:"maintenance" json:"maintenance" validate:"required"`
+}
+
+// ======================================================================================
+// Default Configuration Setter
+
+/*
+The defaults describe one coherent single-host development deployment: a loopback Postgres, the
+sidecar image this repo's own `sidecar/Makefile` builds, and every tunable set to a value that
+works before anything is tuned.
+
+What is deliberately left undefaulted is what names a specific deployment's resources - the
+object store endpoint and the bucket. There is no value for those that is right anywhere but
+where it was written, and a wrong-but-present default is worse than an absent one:
+`validate:"required"` reports the missing field by name at startup, whereas a default silently
+points the service at something that was never meant to hold artifacts.
+
+Credentials are not addressed here at all: neither the object store's nor the database's is a
+config file key (see ObjectStoreConfig.Creds, which carries no `mapstructure` tag). They are
+supplied on the command line or through the environment and installed onto the config after it
+is read, so there is nothing here for a default to reach.
+*/
+
+// defaultSidecarTimeoutSecs the wall-clock ceiling on a single transfer sidecar run.
+//
+// Named because three defaults are derived from it rather than chosen independently: the API's
+// write timeout has to outlast the sidecars a request launches, and a presigned URL has to
+// outlive the transfer it was minted for. Retuning the sidecar timeout in a config file without
+// revisiting those two leaves them inconsistent, so the relationship is at least written down
+// here for the shipped values.
+const defaultSidecarTimeoutSecs = 300
+
+// defaultPresignedURLMarginSecs how much longer than a sidecar's own run a presigned URL lives,
+// covering container startup (DESIGN §5.2). Mirrors `getURLTTLMargin` on the download path.
+const defaultPresignedURLMarginSecs = 60
+
+// InstallDefaultServerConfigValues setup default server configs
+func InstallDefaultServerConfigValues() {
+	// Default application config
+	viper.SetDefault("appName", "cairn")
+
+	// Default persistence config
+	viper.SetDefault("persistence.sql.app.debugLog", false)
+	viper.SetDefault("persistence.sql.app.host", "127.0.0.1")
+	viper.SetDefault("persistence.sql.app.port", 5432)
+	viper.SetDefault("persistence.sql.app.db", "cairn")
+	viper.SetDefault("persistence.sql.app.user", "cairn")
+	// Off to match the loopback host above, where there is no network to protect. A deployment
+	// that moves the database off the host is the one that turns this on. The password is not a
+	// config key at all - it is supplied out of band and handed to GetPostgresDialector.
+	viper.SetDefault("persistence.sql.app.ssl.enabled", false)
+
+	// Default metrics config
+	viper.SetDefault("metrics.metricsEndpoint", "/metrics")
+	viper.SetDefault("metrics.maxRequests", 4)
+	// Default metrics features config
+	viper.SetDefault("metrics.features.enableAppMetrics", false)
+	viper.SetDefault("metrics.features.enableHTTPMetrics", true)
+	// Default metrics HTTP server config
+	viper.SetDefault("metrics.service.listenOn", "0.0.0.0")
+	viper.SetDefault("metrics.service.appPort", 3001)
+	viper.SetDefault("metrics.service.timeoutSecs.read", 60)
+	viper.SetDefault("metrics.service.timeoutSecs.write", 60)
+	viper.SetDefault("metrics.service.timeoutSecs.idle", 60)
+
+	// Default API HTTP server config
+	viper.SetDefault("api.service.listenOn", "0.0.0.0")
+	viper.SetDefault("api.service.appPort", 44123)
+	viper.SetDefault("api.service.timeoutSecs.read", 60)
+	// The slowest request the API serves is a volume based upload: two sidecar runs back to back
+	// - stat then transfer (DESIGN §6.4) - plus the object store copy. A shorter write timeout
+	// would cut the caller off from a transfer that is still running and will still complete,
+	// leaving the artifact recorded but the caller told nothing.
+	viper.SetDefault(
+		"api.service.timeoutSecs.write", (defaultSidecarTimeoutSecs*2)+defaultPresignedURLMarginSecs,
+	)
+	viper.SetDefault("api.service.timeoutSecs.idle", 60)
+
+	// Default API config
+	viper.SetDefault("api.apis.endPoint.pathPrefix", "/")
+	viper.SetDefault("api.apis.requestLogging.logLevel", "warn")
+	viper.SetDefault("api.apis.requestLogging.healthLogLevel", "debug")
+	viper.SetDefault("api.apis.requestLogging.requestIDHeader", "X-Request-ID")
+	viper.SetDefault("api.apis.requestLogging.skipHeaders", []string{
+		"WWW-Authenticate", "Authorization", "Proxy-Authenticate", "Proxy-Authorization",
+	})
+	viper.SetDefault("api.apis.requestLogging.logRequestPayload", false)
+
+	// Default MCP API config
+	viper.SetDefault("api.apis.mcp.enable", false)
+	// On, so that a deployment opts out of the SDK's own protection deliberately rather than by
+	// never naming the key. The one deployment that has to opt out - a same host reverse proxy
+	// dialing loopback - is also the one whose operator knows they placed ingress with the proxy
+	// (see MCPAPIConfig.EnableDNSRebindGuard and DESIGN §2.4).
+	viper.SetDefault("api.apis.mcp.enableDNSRebindGuard", true)
+
+	// Default workspace config
+	viper.SetDefault("workspace.volumeType", string(WorkspaceVolumeTypeDocker))
+
+	// Default artifact object store config
+	//
+	// How long a client is used before the manager replaces it. An hour is short enough that a
+	// rotated credential is picked up on a timescale an operator would call prompt, and long
+	// enough that the rebuild is never on a request's path in practice.
+	viper.SetDefault("artifact.s3.clientTTL", 3600)
+	// The transport defaults to the secure setting. The endpoint has no default, so an operator
+	// is editing this block regardless and can say so if their object store is plaintext.
+	// Getting this wrong fails to connect rather than quietly sending credentials in the clear.
+	viper.SetDefault("artifact.s3.useTLS", true)
+
+	// Default artifact storage config
+	//
+	// The PUT URL only has to outlive the transfer it was minted for (DESIGN §5.2). The GET
+	// URL's ceiling is longer because it also bounds the link the REST API hands an operator,
+	// who may not follow it immediately; the download sidecar asks for far less than the
+	// ceiling and is not bound by it.
+	viper.SetDefault(
+		"artifact.store.putUrlTTLSecs", defaultSidecarTimeoutSecs+defaultPresignedURLMarginSecs,
+	)
+	viper.SetDefault("artifact.store.getUrlMaxTTLSecs", 900)
+	// 1 GiB. Multipart upload is out of scope, so this is a single PUT and the cap has to stay
+	// well under the object store's own single PUT limit - and low enough that an object of
+	// this size still transfers inside a sidecar run.
+	viper.SetDefault("artifact.store.maxObjectSize", 1024*1024*1024)
+	viper.SetDefault("artifact.store.prefix.staging", "staging")
+	viper.SetDefault("artifact.store.prefix.store", "store")
+
+	// Default artifact sidecar config
+	viper.SetDefault("artifact.sidecar.image", "alwitt/cairn-sidecar:latest")
+	viper.SetDefault("artifact.sidecar.timeoutSecs", defaultSidecarTimeoutSecs)
+	viper.SetDefault("artifact.sidecar.networkMode", DefaultSidecarNetworkMode)
+
+	// Default maintenance config
+	viper.SetDefault("maintenance.sweepIntSec", 300)
+	// The grace window has to comfortably exceed the longest in-flight upload, or a sweep would
+	// flag the staging object of a transfer that is still running (DESIGN §8.2.1).
+	viper.SetDefault("maintenance.objAgeOutSec", 3600)
 }

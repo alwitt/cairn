@@ -67,10 +67,10 @@ func buildArtifactAPIHandler(
 		mocks.artifacts,
 		mocks.operator,
 		models.ArtifactStorageConfig{
-			Bucket:                  "unit-test-bucket",
-			UploadPutURLTTLSec:      300,
-			DownloadGetURLMaxTTLSec: unitTestGetURLMaxTTLSecs,
-			MaxObjectSizeBytes:      1024 * 1024,
+			Bucket:                   "unit-test-bucket",
+			UploadPutURLTTLSecs:      300,
+			DownloadGetURLMaxTTLSecs: unitTestGetURLMaxTTLSecs,
+			MaxObjectSizeBytes:       1024 * 1024,
 		},
 		models.HTTPRequestLogging{
 			LogLevel:        goutils.HTTPLogLevelWARN,

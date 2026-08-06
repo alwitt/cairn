@@ -25,7 +25,7 @@ fix: .prepare ## Lint and fix violations
 
 .PHONY: build
 build: lint ## Build application
-	@go build -o cairn .
+	@CGO_ENABLED=0 go build -ldflags "-s -w" -o cairn .
 
 .PHONY: test
 test: .prepare ## Run unit tests
@@ -50,6 +50,22 @@ up: .prepare ## Start docker compose development stack
 .PHONY: down
 down: .prepare ## Stop docker compose development stack
 	docker compose -f docker/docker-compose.yml down
+
+.PHONY: gen-migrate
+gen-migrate: ## Define new database migration
+	atlas migrate diff \
+	  --env gorm \
+	  --format '{{ sql . "  " }}'
+
+.PHONY: dev-migrate
+dev-migrate: ## Test apply database migration to DEV Postgres
+	atlas migrate apply \
+	  --env gorm \
+	  --url "postgres://cairn:cairn@localhost:6532/postgres?search_path=public&sslmode=disable"
+
+.PHONY: api
+api: build ## Start local development API server
+	. .env && ./cairn server -c demo/server_config.yml
 
 .prepare: ## Prepare the project for local development
 	@pip3 install pre-commit

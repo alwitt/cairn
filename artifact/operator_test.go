@@ -62,7 +62,7 @@ func newUnitTestOperatorWithConfig(
 		callbacks: mocktest.NewUnitTestCallbackCollector(t),
 	}
 
-	operator, err := artifact.NewOperator(
+	operator, err := artifact.NewDockerOperator(
 		unitTestAppName,
 		mocks.manager,
 		sidecarConfig,
@@ -260,7 +260,7 @@ func TestNewOperator(t *testing.T) {
 		assert := assert.New(t)
 
 		callbacks := mocktest.NewUnitTestCallbackCollector(t)
-		_, err := artifact.NewOperator(
+		_, err := artifact.NewDockerOperator(
 			unitTestAppName, nil, unitTestSidecarConfig(),
 			callbacks.DefineSystemCallDockerRuntime,
 		)
@@ -274,7 +274,7 @@ func TestNewOperator(t *testing.T) {
 		assert := assert.New(t)
 
 		manager := mockartifact.NewManager(t)
-		_, err := artifact.NewOperator(
+		_, err := artifact.NewDockerOperator(
 			unitTestAppName, manager, unitTestSidecarConfig(), nil,
 		)
 
@@ -292,7 +292,7 @@ func TestNewOperator(t *testing.T) {
 		config := unitTestSidecarConfig()
 		config.Image = ""
 
-		_, err := artifact.NewOperator(
+		_, err := artifact.NewDockerOperator(
 			unitTestAppName, manager, config, callbacks.DefineSystemCallDockerRuntime,
 		)
 
@@ -308,7 +308,7 @@ func TestNewOperator(t *testing.T) {
 		config := unitTestSidecarConfig()
 		config.TimeoutSecs = 0
 
-		_, err := artifact.NewOperator(
+		_, err := artifact.NewDockerOperator(
 			unitTestAppName, manager, config, callbacks.DefineSystemCallDockerRuntime,
 		)
 

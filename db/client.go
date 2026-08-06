@@ -4,9 +4,12 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
 	"github.com/apex/log"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -20,6 +23,45 @@ GetSqliteDialector define Sqlite GORM dialector
 */
 func GetSqliteDialector(dbFile string) gorm.Dialector {
 	return sqlite.Open(fmt.Sprintf("%s?_foreign_keys=on", dbFile))
+}
+
+/*
+GetPostgresDialector define Postgres driver dialector
+
+	@param config common.PostgresConfig - connection config
+	@returns GORM Postgres dialector
+*/
+func GetPostgresDialector(config models.PostgresConfig) (gorm.Dialector, error) {
+	/*
+		Configuration has be affected by
+
+		* Whether to use password
+		* Whether to use SSL
+	*/
+	configParams := []string{
+		fmt.Sprintf("host=%s", config.Host),
+		fmt.Sprintf("port=%d", config.Port),
+		fmt.Sprintf("dbname=%s", config.Database),
+		fmt.Sprintf("user=%s", config.User),
+	}
+	// When password is specified
+	if config.Password != nil {
+		configParams = append(configParams, fmt.Sprintf("password=%s", *config.Password))
+	}
+	// When using SSL
+	if config.SSL.Enabled {
+		if config.SSL.CAFile == nil {
+			return nil, goutils.NewConsistencyError(
+				"can't connect to Postgres with SSL without specific CA cert", nil, true,
+			)
+		}
+		configParams = append(configParams, []string{
+			"sslmode=verify-full",
+			fmt.Sprintf("sslrootcert=%s", *config.SSL.CAFile),
+		}...)
+	}
+	// Build the complete dialectic string
+	return postgres.Open(strings.Join(configParams, " ")), nil
 }
 
 // Client manages connections and transactions with a DB

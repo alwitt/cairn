@@ -74,3 +74,30 @@ func NewMaintenanceError(message string, core error, getCallStack bool) Maintena
 	}
 	return MaintenanceError{BaseError: base}
 }
+
+// ======================================================================================
+// Application Lifecycle Errors
+
+// BootStrapError application boot strap error
+type BootStrapError struct{ goutils.BaseError }
+
+// NewBootStrapError builds a BootStrapError, optionally capturing the call stack.
+func NewBootStrapError(message string, core error, getCallStack bool) BootStrapError {
+	base := goutils.BaseError{Name: "BootStrapError", Message: message, Core: core}
+	if getCallStack {
+		base.Stack = goutils.GetCallStack(1)
+	}
+	return BootStrapError{BaseError: base}
+}
+
+// ShutdownError application shutdown error
+type ShutdownError struct{ goutils.BaseError }
+
+// NewShutdownError builds a ShutdownError, optionally capturing the call stack.
+func NewShutdownError(message string, core error, getCallStack bool) ShutdownError {
+	base := goutils.BaseError{Name: "ShutdownError", Message: message, Core: core}
+	if getCallStack {
+		base.Stack = goutils.GetCallStack(1)
+	}
+	return ShutdownError{BaseError: base}
+}
