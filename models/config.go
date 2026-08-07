@@ -1,10 +1,12 @@
 package models
 
 import (
+	"context"
 	"path/filepath"
 	"time"
 
 	"github.com/alwitt/goutils"
+	"github.com/alwitt/goutils/runtime"
 	"github.com/spf13/viper"
 )
 
@@ -351,6 +353,40 @@ func (c ArtifactSidecarConfig) TransferNetworkMode() string {
 func (c ArtifactSidecarConfig) SidecarTimeout() time.Duration {
 	return time.Second * time.Duration(c.TimeoutSecs)
 }
+
+// The identity every cairn sidecar runs as. A workspace volume's mount root is root-owned
+// (see DESIGN §4.2), so a sidecar running as the container runtime's `nobody` default could
+// not write to it at all. Shared by the artifact sidecars and the workspace volume
+// preparation sidecar alike, which is why they live here rather than beside either caller.
+const (
+	// SidecarRunAsUser the user every cairn sidecar's process runs as
+	SidecarRunAsUser = "root"
+	// SidecarRunAsGroup the group every cairn sidecar's process runs as
+	SidecarRunAsGroup = "root"
+)
+
+/*
+SystemCallDockerRuntimeFactory defines a docker container runtime to run a sidecar with.
+
+Injected rather than calling `runtime.NewDockerSystemCallRuntime` directly, so a unit test can
+drive the sidecar lifecycle without a docker daemon. It lives here rather than beside either
+caller because both the artifact operator and the workspace manager launch sidecars, and
+neither package should have to import the other for the seam alone.
+
+	@param ctx context.Context - execution context
+	@param name string - container name
+	@param command runtime.ContainerCommand - the container entrypoint and arguments
+	@param params runtime.DockerRuntimeParams - the container runtime parameters
+	@param clearANSIFromOutput bool - whether to strip ANSI escapes from the captured output
+	@returns the new container runtime
+*/
+type SystemCallDockerRuntimeFactory func(
+	ctx context.Context,
+	name string,
+	command runtime.ContainerCommand,
+	params runtime.DockerRuntimeParams,
+	clearANSIFromOutput bool,
+) (runtime.SystemCallRuntime, error)
 
 // ArtifactManagerConfig artifact manager config
 type ArtifactManagerConfig struct {

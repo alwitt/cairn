@@ -205,7 +205,13 @@ func BuildNewServer(parentCtx context.Context, configs models.ApplicationConfig)
 	// Build core
 
 	// Build workspace manager
-	workspaceMgr, err := workspace.NewManager(configs.AppName, persistence, volume)
+	workspaceMgr, err := workspace.NewManager(
+		configs.AppName,
+		persistence,
+		volume,
+		configs.Artifact.Sidecar,
+		runtime.NewDockerSystemCallRuntime,
+	)
 	if err != nil {
 		return nil, models.NewBootStrapError("Failed to prepare workspace manager", err, true)
 	}

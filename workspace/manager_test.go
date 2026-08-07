@@ -8,6 +8,7 @@ import (
 
 	"github.com/alwitt/cairn/db"
 	mockdb "github.com/alwitt/cairn/mocks/db"
+	mocktest "github.com/alwitt/cairn/mocks/test"
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/cairn/workspace"
 	"github.com/alwitt/goutils"
@@ -35,28 +36,107 @@ func runTxForManager(
 	}
 }
 
+const (
+	// unitTestSidecarImage the sidecar image the harness manager is configured with
+	unitTestSidecarImage = "unit-test/cairn-sidecar:latest"
+	// unitTestSidecarTimeoutSec the sidecar timeout the harness manager is configured with
+	unitTestSidecarTimeoutSec = 120
+)
+
+// unitTestSidecarConfig build the sidecar config the harness manager is constructed with.
+//
+// Only `Image` and `TimeoutSecs` are set: volume preparation reads nothing else from it, and
+// leaving the transfer-sidecar fields empty is what lets a test assert they go unused.
+func unitTestSidecarConfig() models.ArtifactSidecarConfig {
+	return models.ArtifactSidecarConfig{
+		Image:       unitTestSidecarImage,
+		TimeoutSecs: unitTestSidecarTimeoutSec,
+	}
+}
+
 // newUnitTestManager build a Manager backed by a mock persistence client, returning both so a
 // test can set expectations on the client. The volume manager is mocked with no expectations
 // set, so any unexpected volume operation fails the test.
 func newUnitTestManager(t *testing.T) (workspace.Manager, *mockdb.Client) {
-	manager, mockClient, _ := newUnitTestManagerWithVolumes(t)
+	manager, mockClient, _, _ := newUnitTestManagerWithVolumes(t)
 	return manager, mockClient
 }
 
-// newUnitTestManagerWithVolumes build a Manager backed by mock persistence and volume
-// clients, returning all three so a test can set expectations on either.
-func newUnitTestManagerWithVolumes(
-	t *testing.T,
-) (workspace.Manager, *mockdb.Client, *mockruntime.VolumeManager) {
+// newUnitTestManagerWithVolumes build a Manager backed by mock persistence, volume, and
+// container runtime collaborators, returning all of them so a test can set expectations on
+// whichever ones its case exercises.
+//
+// No expectations are set on the runtime factory, so launching a preparation sidecar at all
+// fails a case that did not arrange for one - which is how the non-volume cases assert by
+// omission that they never reach Docker.
+func newUnitTestManagerWithVolumes(t *testing.T) (
+	workspace.Manager,
+	*mockdb.Client,
+	*mockruntime.VolumeManager,
+	*mocktest.UnitTestCallbackCollector,
+) {
 	assert := assert.New(t)
 
 	mockClient := mockdb.NewClient(t)
 	mockVolumes := mockruntime.NewVolumeManager(t)
-	manager, err := workspace.NewManager(unitTestAppName, mockClient, mockVolumes)
+	mockCallbacks := mocktest.NewUnitTestCallbackCollector(t)
+
+	manager, err := workspace.NewManager(
+		unitTestAppName,
+		mockClient,
+		mockVolumes,
+		unitTestSidecarConfig(),
+		mockCallbacks.DefineSystemCallDockerRuntime,
+	)
 	assert.Nil(err)
 	assert.NotNil(manager)
 
-	return manager, mockClient, mockVolumes
+	return manager, mockClient, mockVolumes, mockCallbacks
+}
+
+// expectVolumePrepRun arrange a volume preparation sidecar launch that runs to completion with
+// the supplied exit code, capturing the command and params it was launched with.
+//
+// Cleanup is always expected: the manager must tear the container down on every path.
+func expectVolumePrepRun(
+	t *testing.T, mockCallbacks *mocktest.UnitTestCallbackCollector, output string, exitCode int,
+) *capturedVolumePrep {
+	captured := new(capturedVolumePrep)
+
+	sidecar := mockruntime.NewSystemCallRuntime(t)
+	sidecar.EXPECT().Start(mock.Anything).Return(nil).Once()
+	sidecar.EXPECT().
+		Wait(mock.Anything).
+		Return(runtime.SystemCallResp{ExitCode: exitCode, Output: output}, nil).
+		Once()
+	sidecar.EXPECT().Cleanup(mock.Anything).Return(nil).Once()
+
+	mockCallbacks.EXPECT().
+		DefineSystemCallDockerRuntime(
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+		).
+		RunAndReturn(func(
+			_ context.Context,
+			name string,
+			command runtime.ContainerCommand,
+			params runtime.DockerRuntimeParams,
+			_ bool,
+		) (runtime.SystemCallRuntime, error) {
+			captured.name = name
+			captured.command = command
+			captured.params = params
+			return sidecar, nil
+		}).
+		Once()
+
+	return captured
+}
+
+// capturedVolumePrep what a preparation sidecar was launched with, recorded at define time.
+type capturedVolumePrep struct {
+	name    string
+	command runtime.ContainerCommand
+	params  runtime.DockerRuntimeParams
 }
 
 // expectVolumeMountLookup arrange the volume lookup that every successful workspace fetch
@@ -144,7 +224,11 @@ func TestNewManager(t *testing.T) {
 		assert := assert.New(t)
 
 		manager, err := workspace.NewManager(
-			unitTestAppName, mockdb.NewClient(t), mockruntime.NewVolumeManager(t),
+			unitTestAppName,
+			mockdb.NewClient(t),
+			mockruntime.NewVolumeManager(t),
+			unitTestSidecarConfig(),
+			mocktest.NewUnitTestCallbackCollector(t).DefineSystemCallDockerRuntime,
 		)
 		assert.Nil(err)
 		assert.NotNil(manager)
@@ -158,7 +242,11 @@ func TestNewManager(t *testing.T) {
 
 		for _, appName := range []string{"", "has space", "has/slash", "has.dot"} {
 			manager, err := workspace.NewManager(
-				appName, mockdb.NewClient(t), mockruntime.NewVolumeManager(t),
+				appName,
+				mockdb.NewClient(t),
+				mockruntime.NewVolumeManager(t),
+				unitTestSidecarConfig(),
+				mocktest.NewUnitTestCallbackCollector(t).DefineSystemCallDockerRuntime,
 			)
 			assert.Nil(manager, "application name '%s' should be rejected", appName)
 			assert.NotNil(err, "application name '%s' should be rejected", appName)
@@ -174,7 +262,11 @@ func TestNewManager(t *testing.T) {
 		assert := assert.New(t)
 
 		manager, err := workspace.NewManager(
-			unitTestAppName, nil, mockruntime.NewVolumeManager(t),
+			unitTestAppName,
+			nil,
+			mockruntime.NewVolumeManager(t),
+			unitTestSidecarConfig(),
+			mocktest.NewUnitTestCallbackCollector(t).DefineSystemCallDockerRuntime,
 		)
 		assert.Nil(manager)
 		assert.NotNil(err)
@@ -183,9 +275,58 @@ func TestNewManager(t *testing.T) {
 	t.Run("nil volume manager rejected", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, err := workspace.NewManager(unitTestAppName, mockdb.NewClient(t), nil)
+		manager, err := workspace.NewManager(
+			unitTestAppName,
+			mockdb.NewClient(t),
+			nil,
+			unitTestSidecarConfig(),
+			mocktest.NewUnitTestCallbackCollector(t).DefineSystemCallDockerRuntime,
+		)
 		assert.Nil(manager)
 		assert.NotNil(err)
+	})
+
+	// The runtime driver is deliberately not defaulted, so a wiring site that forgets it fails
+	// here rather than at the first volume provisioning.
+	t.Run("nil container runtime factory rejected", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, err := workspace.NewManager(
+			unitTestAppName,
+			mockdb.NewClient(t),
+			mockruntime.NewVolumeManager(t),
+			unitTestSidecarConfig(),
+			nil,
+		)
+		assert.Nil(manager)
+		assert.NotNil(err)
+	})
+
+	// Validated at construction so a deployment missing a sidecar image or timeout is caught at
+	// startup, not when an operator first tries to provision a volume.
+	t.Run("invalid sidecar config rejected", func(t *testing.T) {
+		assert := assert.New(t)
+
+		for _, sidecarConfig := range []models.ArtifactSidecarConfig{
+			{TimeoutSecs: unitTestSidecarTimeoutSec}, // no image
+			{Image: unitTestSidecarImage},            // no timeout
+			{Image: unitTestSidecarImage, TimeoutSecs: -1},
+		} {
+			manager, err := workspace.NewManager(
+				unitTestAppName,
+				mockdb.NewClient(t),
+				mockruntime.NewVolumeManager(t),
+				sidecarConfig,
+				mocktest.NewUnitTestCallbackCollector(t).DefineSystemCallDockerRuntime,
+			)
+			assert.Nil(manager, "sidecar config %+v should be rejected", sidecarConfig)
+			assert.NotNil(err, "sidecar config %+v should be rejected", sidecarConfig)
+
+			var validationErr goutils.ValidationError
+			assert.True(
+				errors.As(err, &validationErr), "expected ValidationError, got %T: %v", err, err,
+			)
+		}
 	})
 }
 
@@ -203,7 +344,7 @@ func TestManagerActiveSession(t *testing.T) {
 	t.Run("existing session is used directly", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		expectVolumeMountLookup(mockVolumes, entry, nil)
 
@@ -219,7 +360,7 @@ func TestManagerActiveSession(t *testing.T) {
 	t.Run("nil session opens a transaction", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		expectVolumeMountLookup(mockVolumes, entry, nil)
 
@@ -369,7 +510,7 @@ func TestManagerGetWorkspace(t *testing.T) {
 	t.Run("fetch by ID", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockDatabase := mockdb.NewDatabase(t)
@@ -395,7 +536,7 @@ func TestManagerGetWorkspace(t *testing.T) {
 	t.Run("mount count unavailable", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockDatabase := mockdb.NewDatabase(t)
@@ -454,7 +595,7 @@ func TestManagerGetWorkspaceByName(t *testing.T) {
 	t.Run("fetch by name", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockDatabase := mockdb.NewDatabase(t)
@@ -916,7 +1057,7 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("defines a missing volume", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().
@@ -931,6 +1072,8 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil).
 			Once()
 
+		launched := expectVolumePrepRun(t, mockCallbacks, "", 0)
+
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
 		mockClient.EXPECT().
@@ -938,6 +1081,47 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 			RunAndReturn(runTxForManager(mockDatabase))
 
 		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, nil))
+
+		// The preparation sidecar mounts the volume that was just defined, at the canonical
+		// path every other container agrees on (see DESIGN §4.4).
+		assert.Equal(
+			[]runtime.ContainerVolumeMount{
+				{Name: entry.VolumeName, MountPath: models.WorkspaceMountPath},
+			},
+			launched.params.VolumeMounts,
+		)
+
+		// Root, because the mount root is root-owned and a `nobody` sidecar could not touch it
+		// (see DESIGN §4.2).
+		assert.Equal(models.SidecarRunAsUser, launched.params.RunAsUser)
+		assert.Equal(models.SidecarRunAsGroup, launched.params.RunAsGroup)
+
+		// No capability is added: owner match alone carries chmod/chown on a root-owned mount
+		// root. Asserted so a copy-paste of the artifact sidecar's DAC_OVERRIDE is caught.
+		assert.Empty(launched.params.AddCapabilities)
+
+		// Not the transfer sidecars' routable default - this container reaches nothing.
+		assert.Equal("none", launched.params.NetworkMode)
+
+		// Only Image and TimeoutSecs are read from the shared sidecar config; the transfer
+		// fields must not leak into a container that has no network to use them on.
+		assert.Equal(unitTestSidecarImage, launched.params.Image)
+		assert.Equal(unitTestSidecarTimeoutSec, launched.params.TimeoutSecs)
+		assert.Empty(launched.params.Environment)
+		assert.Empty(launched.params.ExtraHosts)
+
+		// The command opens the mount root and nothing below it: a recursive pass would stomp
+		// modes the workspace's own participants chose (see DESIGN §7.5.1).
+		assert.Equal([]string{"/bin/sh"}, launched.command.Entrypoint)
+		assert.Len(launched.command.Commands, 2)
+		assert.Equal("-c", launched.command.Commands[0])
+		assert.Contains(launched.command.Commands[1], "chmod 0777 "+models.WorkspaceMountPath)
+		assert.Contains(launched.command.Commands[1], "chown root:root "+models.WorkspaceMountPath)
+		assert.NotContains(launched.command.Commands[1], "-R")
+
+		// Attributable to this deployment and to the workspace it was run for.
+		assert.Contains(launched.name, unitTestAppName)
+		assert.Contains(launched.name, entry.ID)
 	})
 
 	// Case 2: a requested capacity reaches Docker. This is the only consumer of the
@@ -946,7 +1130,7 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("requested size reaches the volume manager", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspaceWithVolumeSize("unit-test-workspace", 4096)
 
 		mockVolumes.EXPECT().
@@ -960,6 +1144,8 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 			).
 			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil).
 			Once()
+
+		expectVolumePrepRun(t, mockCallbacks, "", 0)
 
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
@@ -976,12 +1162,17 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("adopts an existing volume", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().
 			GetVolume(mock.Anything, entry.VolumeName).
 			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+
+		// The adopt path prepares too. An adopted volume may predate this rule or have been
+		// created by hand, so it needs the same pass as a fresh one (see DESIGN §4.2). The
+		// `.Once()` inside this helper is what asserts it ran.
+		launched := expectVolumePrepRun(t, mockCallbacks, "", 0)
 
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
@@ -992,6 +1183,8 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 		// Adoption still records READY - that is what repairs a workspace whose column drifted
 		// to NONE while its volume lived on (see DESIGN §8.2.2).
 		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, nil))
+
+		assert.Equal(entry.VolumeName, launched.params.VolumeMounts[0].Name)
 	})
 
 	// Case 4: a failed define must not be recorded. The column may only claim READY after
@@ -1000,7 +1193,7 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("no state write when the define fails", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		dockerFailure := fmt.Errorf("docker daemon refused")
 
@@ -1021,7 +1214,7 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("inspect failure aborts the setup", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		dockerFailure := fmt.Errorf("docker is unreachable")
 
@@ -1038,13 +1231,15 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("persistence failure is wrapped", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		dbFailure := fmt.Errorf("database is locked")
 
 		mockVolumes.EXPECT().
 			GetVolume(mock.Anything, entry.VolumeName).
 			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
+
+		expectVolumePrepRun(t, mockCallbacks, "", 0)
 
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
@@ -1063,17 +1258,53 @@ func TestManagerSetupWorkspaceVolume(t *testing.T) {
 	t.Run("existing session is used directly", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().
 			GetVolume(mock.Anything, entry.VolumeName).
 			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil, nil)
 
+		expectVolumePrepRun(t, mockCallbacks, "", 0)
+
 		activeSession := mockdb.NewDatabase(t)
 		activeSession.EXPECT().MarkWorkspaceVolumeReady(mock.Anything, entry.ID).Return(nil)
 
 		assert.Nil(manager.SetupWorkspaceVolume(utCtx, entry, activeSession))
+	})
+
+	// Case 8: a volume Docker provisioned but the preparation sidecar could not open is NOT
+	// advertised as ready. Ordering the pass before the state write is what makes that hold -
+	// the volume is left behind as an orphan for §8.2.2 to reconcile, rather than being handed
+	// to an agent that cannot write to it. Persistence is never reached, so the mock client has
+	// no expectations set.
+	t.Run("no state write when the preparation sidecar fails", func(t *testing.T) {
+		assert := assert.New(t)
+
+		manager, _, mockVolumes, mockCallbacks := newUnitTestManagerWithVolumes(t)
+		entry := sampleWorkspace("unit-test-workspace")
+
+		mockVolumes.EXPECT().
+			GetVolume(mock.Anything, entry.VolumeName).
+			Return(runtime.ContainerVolume{}, nil, goutils.NewNotFoundError("absent", nil, true))
+		mockVolumes.EXPECT().
+			DefineVolume(mock.Anything, mock.Anything, mock.Anything).
+			Return(runtime.ContainerVolume{Name: entry.VolumeName}, nil).
+			Once()
+
+		expectVolumePrepRun(t, mockCallbacks, "chmod: Operation not permitted", 1)
+
+		err := manager.SetupWorkspaceVolume(utCtx, entry, nil)
+		assert.NotNil(err)
+
+		var managerErr models.WorkspaceMangerError
+		assert.True(
+			errors.As(err, &managerErr), "expected WorkspaceMangerError, got %T: %v", err, err,
+		)
+
+		// The shell's own complaint is the only evidence of what went wrong, so it has to reach
+		// the caller rather than being flattened to an exit code.
+		assert.Contains(err.Error(), "Operation not permitted")
 	})
 }
 
@@ -1088,7 +1319,7 @@ func TestManagerListWorkspaceVolumes(t *testing.T) {
 	t.Run("lists by the application name prefix", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		expectedPrefix := fmt.Sprintf("%s-", unitTestAppName)
 
 		mockVolumes.EXPECT().
@@ -1109,7 +1340,7 @@ func TestManagerListWorkspaceVolumes(t *testing.T) {
 	t.Run("empty listing", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 
 		mockVolumes.EXPECT().
 			ListVolumes(mock.Anything, mock.Anything).
@@ -1125,7 +1356,7 @@ func TestManagerListWorkspaceVolumes(t *testing.T) {
 	t.Run("docker failure is wrapped", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		dockerFailure := fmt.Errorf("docker is unreachable")
 
 		mockVolumes.EXPECT().
@@ -1149,7 +1380,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("deletes an existing volume", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().
@@ -1175,7 +1406,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("absent volume is not an error", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().
@@ -1201,7 +1432,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("mounted volume refusal is surfaced", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		refusal := goutils.NewConsistencyError(
 			fmt.Sprintf(
@@ -1236,7 +1467,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("inspect failure aborts the teardown", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		dockerFailure := fmt.Errorf("docker is unreachable")
 
@@ -1252,7 +1483,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("persistence failure is wrapped", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, mockClient, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, mockClient, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 		dbFailure := fmt.Errorf("database is locked")
 
@@ -1280,7 +1511,7 @@ func TestManagerTeardownWorkspaceVolume(t *testing.T) {
 	t.Run("existing session is used directly", func(t *testing.T) {
 		assert := assert.New(t)
 
-		manager, _, mockVolumes := newUnitTestManagerWithVolumes(t)
+		manager, _, mockVolumes, _ := newUnitTestManagerWithVolumes(t)
 		entry := sampleWorkspace("unit-test-workspace")
 
 		mockVolumes.EXPECT().

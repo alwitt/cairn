@@ -21,6 +21,11 @@ import (
 // URL out of `/proc/<pid>/cmdline` and leaves no argv for an agent-influenced value to reach
 // (see DESIGN §5.1, §5.2).
 
+// sidecarCapabilityDACOverride the one Linux capability an artifact sidecar is granted on top
+// of the runtime's drop-everything default. See `buildSidecarParams` for why root alone does
+// not cover it.
+const sidecarCapabilityDACOverride = "DAC_OVERRIDE"
+
 const (
 	// sidecarStatEntrypoint the stat/hash sidecar's entrypoint
 	sidecarStatEntrypoint = "cairn-stat"
@@ -152,8 +157,19 @@ func (o *dockerOperatorImpl) runSidecar(
 // buildSidecarParams assemble the container runtime parameters for a sidecar.
 //
 // The security posture is the runtime's own defaults - a read-only root filesystem, all
-// capabilities dropped, no new privileges - none of which a sidecar needs relaxed: it writes
-// only to the mounted workspace volume.
+// capabilities dropped, no new privileges - with exactly two relaxations, applied to every
+// sidecar because every one of them touches the workspace volume (see DESIGN §5.1).
+//
+// The sidecar runs as `root` because the volume's mount root is root-owned (see DESIGN §4.2);
+// a `nobody` sidecar could not write to it at all. Root alone is not enough, though: with all
+// capabilities dropped, uid 0 may only touch what it *owns*, so it can neither write into a
+// `0755` directory the agent created nor read a `0600` file the agent produced. `DAC_OVERRIDE`
+// is what supplies that, and both directions need it - the download writes into a directory the
+// agent laid out, and the stat/upload sidecars read a file it produced.
+//
+// `CHOWN` and `FOWNER` are deliberately NOT granted: after provisioning, cairn never re-owns or
+// re-modes anything in the volume (see DESIGN §7.5.1). The read-only root filesystem is
+// untouched by any of this - that is a mount flag, which no capability bypasses.
 func (o *dockerOperatorImpl) buildSidecarParams(
 	workspace models.Workspace, env []runtime.ContainerEnvVar, networkMode string,
 ) runtime.DockerRuntimeParams {
@@ -187,10 +203,13 @@ func (o *dockerOperatorImpl) buildSidecarParams(
 			VolumeMounts: []runtime.ContainerVolumeMount{
 				{Name: workspace.VolumeName, MountPath: models.WorkspaceMountPath},
 			},
-			ExtraHosts:  extraHosts,
-			Environment: environment,
-			TimeoutSecs: o.sidecarConfig.TimeoutSecs,
+			AddCapabilities: []string{sidecarCapabilityDACOverride},
+			ExtraHosts:      extraHosts,
+			Environment:     environment,
+			TimeoutSecs:     o.sidecarConfig.TimeoutSecs,
 		},
+		RunAsUser:   models.SidecarRunAsUser,
+		RunAsGroup:  models.SidecarRunAsGroup,
 		NetworkMode: networkMode,
 	}
 }

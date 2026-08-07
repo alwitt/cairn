@@ -70,10 +70,14 @@ Idempotent (see DESIGN §4.2): a volume that already exists is adopted rather th
 re-created, so this also repairs a workspace whose `VolumeState` drifted to `NONE` while its
 volume lived on (see DESIGN §8.2.2).
 
-The volume is created before the state column is written, so the column is only ever set
-`READY` after Docker has actually provisioned it (see DESIGN §4.2). One consequence of that
-ordering: when run inside an `activeSession`, a later rollback of that transaction undoes
-the column write but not the volume - reconciliation is what settles the difference.
+Provisioning is two steps, not one. A volume Docker just created is `root:root 0755` and so
+is writable by nobody at all; a preparation sidecar opens its mount root before the workspace
+is advertised as ready (see DESIGN §4.2). Both the create and the adopt path run it.
+
+The volume is created and prepared before the state column is written, so the column is only
+ever set `READY` after Docker has actually provisioned it (see DESIGN §4.2). One consequence
+of that ordering: when run inside an `activeSession`, a later rollback of that transaction
+undoes the column write but not the volume - reconciliation is what settles the difference.
 
 	@param ctx context.Context - execution context
 	@param workspace models.Workspace - the workspace whose volume to provision
@@ -109,7 +113,7 @@ func (m *managerImpl) SetupWorkspaceVolume(
 			)
 		}
 		log.
-			WithFields(logTags).
+			WithFields(goutils.UpdateCodePositionInTags(logTags)).
 			WithField("volume", workspace.VolumeName).
 			Debug("Defined workspace persistent volume")
 	} else {
@@ -117,9 +121,22 @@ func (m *managerImpl) SetupWorkspaceVolume(
 		// to start clean is exactly the auto-reap DESIGN §4.2 forbids - other systems may be
 		// mounting it.
 		log.
-			WithFields(logTags).
+			WithFields(goutils.UpdateCodePositionInTags(logTags)).
 			WithField("volume", workspace.VolumeName).
 			Debug("Adopting existing workspace persistent volume")
+	}
+
+	// Deliberately outside the create/adopt branch: an adopted volume may predate this rule,
+	// or have been created by hand, so it needs the same pass (see DESIGN §4.2). The pass is
+	// idempotent, so re-running it against an already-prepared volume costs only the container.
+	//
+	// Ordered before the state column is written, which is what makes a failure safe: the
+	// column stays `NONE` and the volume is left behind as an orphan for §8.2.2 to reconcile,
+	// rather than being advertised `READY` while unusable.
+	if err := m.prepareVolumePermissions(ctx, workspace); err != nil {
+		return models.NewWorkspaceMangerError(
+			fmt.Sprintf("failed to set up workspace %s volume", workspace.ID), err, true,
+		)
 	}
 
 	if err := db.ActiveSessionWrapper(

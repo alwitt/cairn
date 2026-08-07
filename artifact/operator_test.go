@@ -550,6 +550,47 @@ func TestOperatorSidecarParameters(t *testing.T) {
 		assert.Equal(models.WorkspaceMountPath, captured.VolumeMounts[0].MountPath)
 	})
 
+	// The security posture, asserted once because `buildSidecarParams` assembles it for every
+	// sidecar - so a regression here silently breaks all three at once (see DESIGN §5.1).
+	t.Run("runs as root with only DAC_OVERRIDE added", func(t *testing.T) {
+		assert := assert.New(t)
+
+		operator, mocks := newUnitTestOperator(t)
+		workspace := sampleWorkspace("unit-test-workspace")
+		entry := sampleArtifact(workspace, "unit-test-artifact")
+
+		mocks.manager.EXPECT().
+			GenerateGetURLForArtifact(mock.Anything, entry, mock.Anything).
+			Return("https://store.unit-test/get", nil).
+			Once()
+		captured := expectSidecarRun(t, mocks, sidecarOutput(map[string]any{"ok": true}), 0)
+
+		assert.Nil(operator.DownloadArtifact(
+			utCtx, workspace, entry, models.WorkspaceMountPath+"/out.txt",
+		))
+
+		// The volume's mount root is root-owned (see DESIGN §4.2), so the runtime's `nobody`
+		// default could not write to the volume at all.
+		assert.Equal(models.SidecarRunAsUser, captured.RunAsUser)
+		assert.Equal(models.SidecarRunAsGroup, captured.RunAsGroup)
+
+		// Exactly one capability. Root alone is not enough - with everything dropped, uid 0 may
+		// only touch what it owns, so it could neither write into an agent-created 0755
+		// directory nor read an agent-created 0600 file.
+		assert.Equal([]string{"DAC_OVERRIDE"}, captured.AddCapabilities)
+
+		// CHOWN and FOWNER are deliberately withheld: after provisioning, cairn never re-owns
+		// or re-modes anything in the volume (see DESIGN §7.5.1).
+		assert.NotContains(captured.AddCapabilities, "CHOWN")
+		assert.NotContains(captured.AddCapabilities, "FOWNER")
+
+		// The rest of the posture is untouched. Left nil so the runtime's own secure defaults
+		// apply; a non-nil value here would mean someone had opted out of one of them.
+		assert.Nil(captured.ReadOnlyRootFS, "read-only rootfs must stay at the runtime default")
+		assert.Nil(captured.DropAllCapabilities, "drop-all must stay at the runtime default")
+		assert.Nil(captured.NoNewPrivileges, "no-new-privileges must stay at the runtime default")
+	})
+
 	// The mount path is supplied to the sidecar rather than compiled into its image.
 	t.Run("passes the mount root to the sidecar", func(t *testing.T) {
 		assert := assert.New(t)

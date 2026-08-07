@@ -16,48 +16,6 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-/*
-SystemCallDockerRuntimeFactory defines a docker container runtime to run a sidecar with.
-
-Injected rather than calling `runtime.NewDockerSystemCallRuntime` directly, so a unit test can
-drive the sidecar lifecycle without a docker daemon. Named for docker specifically because it
-is `dockerOperatorImpl`'s seam; a runtime driver for another orchestrator would take its own.
-
-	@param ctx context.Context - execution context
-	@param name string - container name
-	@param command runtime.ContainerCommand - the container entrypoint and arguments
-	@param params runtime.DockerRuntimeParams - the container runtime parameters
-	@param clearANSIFromOutput bool - whether to strip ANSI escapes from the captured output
-	@returns the new container runtime
-*/
-type SystemCallDockerRuntimeFactory func(
-	ctx context.Context,
-	name string,
-	command runtime.ContainerCommand,
-	params runtime.DockerRuntimeParams,
-	clearANSIFromOutput bool,
-) (runtime.SystemCallRuntime, error)
-
-/*
-DefaultSystemCallDockerRuntimeFactory the production docker container runtime factory.
-
-	@param ctx context.Context - execution context
-	@param name string - container name
-	@param command runtime.ContainerCommand - the container entrypoint and arguments
-	@param params runtime.DockerRuntimeParams - the container runtime parameters
-	@param clearANSIFromOutput bool - whether to strip ANSI escapes from the captured output
-	@returns the new container runtime
-*/
-func DefaultSystemCallDockerRuntimeFactory(
-	ctx context.Context,
-	name string,
-	command runtime.ContainerCommand,
-	params runtime.DockerRuntimeParams,
-	clearANSIFromOutput bool,
-) (runtime.SystemCallRuntime, error) {
-	return runtime.NewDockerSystemCallRuntime(ctx, name, command, params, clearANSIFromOutput)
-}
-
 // Operator artifact tasks operations runner
 //
 // This is the core logic for driving the MCP-tools (and equivalent REST APIs)
@@ -199,7 +157,7 @@ type dockerOperatorImpl struct {
 	manager Manager
 
 	// defineRuntime defines the container runtime a sidecar runs in
-	defineRuntime SystemCallDockerRuntimeFactory
+	defineRuntime models.SystemCallDockerRuntimeFactory
 }
 
 /*
@@ -208,15 +166,15 @@ NewDockerOperator define a new docker driven artifact operator
 	@param appName string - the per-deployment application name
 	@param manager Manager - the core artifact manager the operations are built on
 	@param sidecarConfig models.ArtifactSidecarConfig - artifact operations sidecar config
-	@param defineRuntime SystemCallDockerRuntimeFactory - defines the container runtime a
-	    sidecar runs in. Pass `DefaultSystemCallDockerRuntimeFactory` outside of tests.
+	@param defineRuntime models.SystemCallDockerRuntimeFactory - defines the container runtime a
+	    sidecar runs in. Pass `runtime.NewDockerSystemCallRuntime` outside of tests.
 	@returns the new artifact operator
 */
 func NewDockerOperator(
 	appName string,
 	manager Manager,
 	sidecarConfig models.ArtifactSidecarConfig,
-	defineRuntime SystemCallDockerRuntimeFactory,
+	defineRuntime models.SystemCallDockerRuntimeFactory,
 ) (Operator, error) {
 	logTags := log.Fields{
 		"package": "cairn", "module": "artifact", "component": "operator", "instance": appName,
@@ -239,8 +197,8 @@ func NewDockerOperator(
 		return nil, goutils.NewValidationError("artifact manager is required", nil, true)
 	}
 
-	// Required rather than defaulted to `DefaultSystemCallDockerRuntimeFactory`, so the
-	// choice of runtime driver stays explicit at the wiring site.
+	// Required rather than defaulted to `runtime.NewDockerSystemCallRuntime`, so the choice
+	// of runtime driver stays explicit at the wiring site.
 	if defineRuntime == nil {
 		return nil, goutils.NewValidationError("container runtime factory is required", nil, true)
 	}

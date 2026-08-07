@@ -381,9 +381,14 @@ const mcpServerVersion = "0.1.0"
 //
 // A client MAY fold this into the model's system prompt and MAY ignore it, so nothing
 // load-bearing lives here: every precondition an agent must respect is also stated in the
-// description of the tool that enforces it. What this carries instead is the one thing no
-// single tool description can - why a workspace exists at all, and how the disposable volume
-// and the durable artifacts relate.
+// description of the tool that enforces it. What this carries instead is the two things no
+// single tool description can - what a workspace is scoped to, and how its shared volume and
+// its durable artifacts relate.
+//
+// The shared-scratch-space framing is the one an agent is least likely to arrive at on its
+// own, so it is stated at length rather than in passing: the default assumption a model brings
+// is that storage it writes to is its own. Sizing a scope of work is the operator's call (see
+// DESIGN §2.1), so this explains the concept and leaves the boundary to whoever drew it.
 //
 // The mount path is interpolated from the constant rather than written out, so this does not
 // become a second definition of it (see DESIGN §4.4).
@@ -392,10 +397,23 @@ const mcpServerInstructions = `cairn stores durable files, called artifacts, for
 A workspace groups two things: a set of artifacts, and optionally one persistent volume that
 tool containers mount at ` + models.WorkspaceMountPath + `.
 
-The volume is scratch space shared between the tools in a workflow, and it is discarded
-afterwards. Artifacts are durable and outlive it. So the usual shape of a workflow is: a tool
-writes a file into the volume, you upload_artifact it to make it durable, and a later step -
-possibly against a different volume - download_artifact's it back.
+A workspace is the shared scratch space for a scope of work - not for one tool call, and not
+for one agent. A scope of work is whatever unit of activity an operator chose to give a single
+workspace to: a chat session, an agent together with its sub-agents, an entire project. Every
+participant in that scope mounts the same volume: your tool calls, your sub-agents' tool calls,
+and any interactive shell session running alongside you.
+
+Treat that volume the way you would treat a developer's project directory rather than private
+storage. Anything you write there can be read, modified, or deleted by every other participant,
+and anything you find there may have been put there by one of them. That is intended, not a
+hazard to work around - a file one tool writes is meant to be picked up, rewritten, or thrown
+away by the next. Two things follow: do not assume a path you wrote earlier is still untouched,
+and do not remove or overwrite what you did not create unless the task calls for it.
+
+The volume is scratch space and is discarded when its scope of work ends. Artifacts are durable
+and outlive it. So the usual shape of a workflow is: a tool writes a file into the volume, you
+upload_artifact it to make it durable, and a later step - possibly against a different volume -
+download_artifact's it back.
 
 You cannot create a workspace or provision its volume; an operator does that. Use get_workspace
 or list_workspaces to find one and check that its volume state is READY, which every transfer

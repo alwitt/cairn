@@ -237,6 +237,13 @@ type managerImpl struct {
 	// volumes manages the persistent volumes backing workspaces. The manager operates it but
 	// does not own its lifecycle - the caller performs `Start` and `Cleanup`.
 	volumes runtime.VolumeManager
+
+	// sidecarConfig sidecar config. Shared with the artifact operator, though volume
+	// preparation reads only `Image` and `TimeoutSecs` from it.
+	sidecarConfig models.ArtifactSidecarConfig
+
+	// defineRuntime defines the container runtime the volume preparation sidecar runs in
+	defineRuntime models.SystemCallDockerRuntimeFactory
 }
 
 // unknownVolumeMountCount the mount-count estimate reported when the number of entities
@@ -256,10 +263,19 @@ NewManager define a new workspace manager
 	@param volumes runtime.VolumeManager - manager for the persistent volumes backing
 	    workspaces. Its lifecycle is the caller's responsibility; it must already be started,
 	    and this manager never tears it down.
+	@param sidecarConfig models.ArtifactSidecarConfig - sidecar config. Volume preparation
+	    reads only `Image` and `TimeoutSecs`; the rest describes the transfer sidecars.
+	@param defineRuntime models.SystemCallDockerRuntimeFactory - defines the container runtime
+	    the volume preparation sidecar runs in. Pass `runtime.NewDockerSystemCallRuntime`
+	    outside of tests.
 	@returns the new workspace manager
 */
 func NewManager(
-	appName string, persistence db.Client, volumes runtime.VolumeManager,
+	appName string,
+	persistence db.Client,
+	volumes runtime.VolumeManager,
+	sidecarConfig models.ArtifactSidecarConfig,
+	defineRuntime models.SystemCallDockerRuntimeFactory,
 ) (Manager, error) {
 	logTags := log.Fields{
 		"package": "cairn", "module": "workspace", "component": "manager", "instance": appName,
@@ -288,6 +304,18 @@ func NewManager(
 		return nil, goutils.NewValidationError("volume manager is required", nil, true)
 	}
 
+	// Required rather than defaulted to `runtime.NewDockerSystemCallRuntime`, so the choice
+	// of runtime driver stays explicit at the wiring site.
+	if defineRuntime == nil {
+		return nil, goutils.NewValidationError("container runtime factory is required", nil, true)
+	}
+
+	// Validated up front so a missing sidecar image or timeout fails here rather than at the
+	// first volume provisioning.
+	if err := validate.Struct(&sidecarConfig); err != nil {
+		return nil, goutils.NewValidationError("sidecar config is not valid", err, true)
+	}
+
 	instance := &managerImpl{
 		Component: goutils.Component{
 			LogTags: logTags,
@@ -295,10 +323,12 @@ func NewManager(
 				goutils.ModifyLogMetadataByRestRequestParam,
 			},
 		},
-		appName:     appName,
-		validator:   validate,
-		persistence: persistence,
-		volumes:     volumes,
+		appName:       appName,
+		validator:     validate,
+		persistence:   persistence,
+		volumes:       volumes,
+		sidecarConfig: sidecarConfig,
+		defineRuntime: defineRuntime,
 	}
 
 	return instance, nil

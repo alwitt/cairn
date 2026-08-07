@@ -97,6 +97,20 @@ whenever the volume is reaped.
 
 ### 2.1 Workspace
 
+**What a workspace represents.** A workspace is the scratch space for a **scope of
+work** — a chat session, an agent together with its sub-agents, a whole project. It is
+deliberately *not* per-tool-call and *not* per-agent: it is the common ground those
+calls and agents work over, the way a developer's project directory is shared by every
+tool they run against it.
+
+Everything in a workspace is **mutually accessible to every participant in that scope
+of work** — readable, modifiable, and deletable by any container that mounts the
+volume. That is the intent, not a concession. A tool that writes a file expects the
+next tool, a sub-agent, or a `rest-pty` shell session to be able to pick it up, rewrite
+it, or throw it away. Isolation *between* participants is an explicit **non-goal**;
+the only boundary `cairn` enforces is the workspace's own edge (§5.1). Sizing that
+scope — and so deciding who shares one — is the caller's decision, not this service's.
+
 | Field | Type | Notes |
 |---|---|---|
 | `ID` | string (UUID) | Primary identity; drives object-key construction **and** the volume name. |
@@ -268,6 +282,20 @@ created and deleted **explicitly by the operator**.
   Docker has removed it (or failed/refused). On success the DB flips `READY →
   NONE`; on failure/refusal the column stays `READY`.
 
+**Provisioning includes a permission pass.** A freshly created Docker volume's root is
+`root:root 0755`, and nothing about the mounting container changes that — `--user` sets
+the process identity, never the mount's ownership, and there is no `-v` option that
+does. Left as created, *no* tool container could write to the volume, and neither could
+`cairn`'s own sidecars. So volume creation is followed by a short-lived **root sidecar
+that `chmod`s the mount root to `0777`, leaving it `root`-owned** — the shared trust
+domain of §5.1, in the only mode that works across containers whose UIDs `cairn`
+neither controls nor knows.
+
+This step needs **no added capabilities**: the mount root is already `root`-owned, so a
+root process may `chmod` it with every capability dropped. It is applied on the adopt
+path too, not just on create — the pass is idempotent, and a volume left over from a
+prior incarnation (§8.2.2) may predate this rule.
+
 Because both ops write the column **only after** Docker succeeds, `VolumeState`
 has no transient states (§2.1.1). Drift can still arise from *outside* the service
 mutating Docker (a human `docker volume rm`, host pruning, an orphan from a prior
@@ -352,6 +380,48 @@ tier.
 > the transfer sidecars are launched with a **routable** network mode
 > (`artifact.sidecar.networkMode`, defaulting to `bridge`), and the stat sidecar
 > is left at `none`.
+
+**The volume is a single shared trust domain.** Every tool container that mounts a
+workspace volume sits in the top tier above — the one running agent-influenced code —
+and they share that volume without partition: any of them may read, modify, or delete
+anything in it (§2.1). `cairn` neither controls nor knows the UIDs its consumers run
+as, so the mount is uniformly world-writable and `root`-owned; that is the only mode
+under which a shared scratch space works across containers whose identities differ and
+are not knowable in advance. Deliberately **without the sticky bit** — mutual deletion
+is a requirement of the scope-of-work model, and sticky would block it across UIDs.
+
+What *is* enforced is the **mount boundary**. The workspace volume is inside the trust
+domain; a sidecar's own container filesystem is not. A planted symlink, or a `..`
+component in a caller-supplied path, must not be able to carry a write outside the
+mount (§7.5.1) — that boundary matters precisely because the space inside it has none.
+
+**Sidecar capability posture.** The runtime defaults every sidecar to a read-only root
+filesystem, all Linux capabilities dropped, and no-new-privileges. Volume-touching
+sidecars relax exactly two of those, no further:
+
+| Setting | Value | Why |
+|---|---|---|
+| `RunAsUser` | **`root`** | The volume root is `root`-owned (§4.2); a `nobody` sidecar could not write to it. |
+| `CapAdd` | **`DAC_OVERRIDE` only** | Read and write files and directories the tool containers own, in whatever mode they chose. |
+| `ReadOnlyRootFS` | unchanged (**true**) | A sidecar writes only to the mounted volume. |
+| `NoNewPrivileges` | unchanged (**true**) | — |
+| every other capability | **dropped** | — |
+
+`DAC_OVERRIDE` supplies precisely what `root` alone does not. With all capabilities
+dropped, uid 0 may touch only what it *owns* — so it can neither write into an
+agent-created `0755` directory nor read an agent-created `0600` file. **Both directions
+need it**: the download writes into a directory the agent laid out, and the stat/upload
+sidecars read a file the agent produced. `CHOWN` and `FOWNER` are deliberately **not**
+granted — after provisioning, `cairn` never re-owns or re-modes anything in the volume
+(§7.5.1).
+
+**Containment of a stray write rests on the sidecar having nowhere to write**, not on
+the read-only rootfs alone — `/dev` and `/dev/shm` are writable tmpfs even under it.
+What makes a path that escapes the mount a non-event is that a sidecar carries **no
+host mounts, no memory-backed writable dirs, and no persistent storage of any kind**,
+and is destroyed on exit: such a write lands in ephemeral container-local space and
+reaches nothing. Granting a sidecar a host mount would reopen this regardless of the
+read-only rootfs.
 
 ### 5.2 Presigned URLs eliminate in-sandbox credentials
 The service holds object-store credentials and mints **short-lived, key- and
@@ -781,12 +851,21 @@ the front-ends differ by more than addressing:
 #### 7.5.1 Download write-path semantics (`download_artifact` → volume)
 The `cairn-download` sidecar streams the artifact to `/mnt/cairn/ws/<path>` after
 path validation (§7.5). It does **not** create intermediate directories — **the agent
-must prepare the destination directory before calling `download_artifact`.** cairn
-cannot safely `mkdir -p` the parents: it does not control the UID/GID the tool
-containers run as (§4.2 — multiple external mounters), so any directory the sidecar
-created would be owned by the sidecar's UID and unwritable/undeletable by the real
-tool containers — a downstream permission landmine. Directory layout is the agent's
-job, done from its own correctly-UID'd tool container.
+must prepare the destination directory before calling `download_artifact`.**
+
+This is a **scope choice, not a capability limit.** The sidecar runs as `root` with
+`DAC_OVERRIDE` (§5.1), so it *could* build the chain. Doing so would mean walking a
+path whose every component the agent can rewrite concurrently, and picking a mode and
+owner for directories that are the agent's to lay out — buying a symlink and TOCTOU
+surface, plus a rule for what `cairn` does to a directory it finds already there, in
+exchange for a `mkdir` the agent can perform itself. Directory layout stays the agent's
+job; `cairn` writes the file. Consequently `cairn` **never re-owns or re-modes** any
+directory in the volume after provisioning (§4.2).
+
+What the sidecar does need is to write into a directory the agent owns, in whatever
+mode that agent's umask produced. That is `DAC_OVERRIDE`'s job — running as `root`
+alone would not be enough, since uid 0 with all capabilities dropped may write only
+where it already owns the directory.
 
 Behavior for the target `/mnt/cairn/ws/<path>`:
 
