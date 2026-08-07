@@ -328,19 +328,42 @@ func TestOperatorWorkspacePathValidation(t *testing.T) {
 	log.SetLevel(log.DebugLevel)
 	utCtx := context.Background()
 
-	rejected := map[string]string{
-		"a relative path":              "some/relative/path.txt",
-		"a path outside the mount":     "/etc/passwd",
-		"traversal escaping the mount": models.WorkspaceMountPath + "/../../etc/passwd",
+	// The expected message is asserted alongside the type, not just the type: every case here
+	// is a BadInputError, so type alone once let the mount root be reported as "outside the
+	// workspace volume mounted at <the same path>" - a contradiction a caller cannot act on.
+	rejected := map[string]struct {
+		path   string
+		expect string
+	}{
+		"a relative path": {
+			path: "some/relative/path.txt", expect: "must be absolute",
+		},
+		"a path outside the mount": {
+			path: "/etc/passwd", expect: "outside the workspace volume",
+		},
+		"traversal escaping the mount": {
+			path:   models.WorkspaceMountPath + "/../../etc/passwd",
+			expect: "outside the workspace volume",
+		},
 		// A sibling directory whose name merely starts with the mount's. Containment is a
 		// path-component test, so `<mount>X` must not read as a match.
-		"a prefix-alike sibling": models.WorkspaceMountPath + "X/out.txt",
-		// The mount root is a directory, never a file to write.
-		"the mount root itself":                    models.WorkspaceMountPath,
-		"the mount root with a trailing separator": models.WorkspaceMountPath + "/",
+		"a prefix-alike sibling": {
+			path:   models.WorkspaceMountPath + "X/out.txt",
+			expect: "outside the workspace volume",
+		},
+		// The mount root is *inside* the volume. What disqualifies it is that it is the
+		// volume's own directory rather than a file within it, and the message has to say so.
+		"the mount root itself": {
+			path:   models.WorkspaceMountPath,
+			expect: "is the workspace volume mount point itself",
+		},
+		"the mount root with a trailing separator": {
+			path:   models.WorkspaceMountPath + "/",
+			expect: "is the workspace volume mount point itself",
+		},
 	}
 
-	for name, path := range rejected {
+	for name, testCase := range rejected {
 		t.Run("rejects "+name, func(t *testing.T) {
 			assert := assert.New(t)
 
@@ -348,9 +371,10 @@ func TestOperatorWorkspacePathValidation(t *testing.T) {
 			workspace := sampleWorkspace("unit-test-workspace")
 			entry := sampleArtifact(workspace, "unit-test-artifact")
 
-			err := operator.DownloadArtifact(utCtx, workspace, entry, path)
+			err := operator.DownloadArtifact(utCtx, workspace, entry, testCase.path)
 
 			assertOperatorBadInputError(assert, err)
+			assert.Contains(err.Error(), testCase.expect)
 			// Nothing was minted either - a rejected path must not cost a presigned URL.
 			mocks.manager.AssertNotCalled(t, "GenerateGetURLForArtifact")
 		})

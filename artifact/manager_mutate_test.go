@@ -7,6 +7,7 @@ import (
 
 	mockdb "github.com/alwitt/cairn/mocks/db"
 	"github.com/alwitt/cairn/models"
+	"github.com/alwitt/goutils"
 	"github.com/apex/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/assert"
@@ -33,7 +34,15 @@ func TestManagerRenameArtifact(t *testing.T) {
 		renamed.Name = newName
 
 		mockDatabase := mockdb.NewDatabase(t)
+		// The pre-read, which supplies the workspace that scopes the uniqueness check.
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		mockDatabase.EXPECT().
+			GetArtifactByName(mock.Anything, workspace.ID, newName).
+			Return(models.Artifact{}, artifactNameFreeError(workspace.ID, newName)).
+			Once()
 		mockDatabase.EXPECT().UpdateArtifactName(mock.Anything, entry.ID, newName).Return(nil).Once()
+		// Registered after the pre-read and matching the same arguments: testify hands out
+		// same-argument expectations in registration order, so this one answers the read-back.
 		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(renamed, nil).Once()
 		mocks.persistence.EXPECT().
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
@@ -66,6 +75,11 @@ func TestManagerRenameArtifact(t *testing.T) {
 		renamed.Name = newName
 
 		activeSession := mockdb.NewDatabase(t)
+		activeSession.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		activeSession.EXPECT().
+			GetArtifactByName(mock.Anything, workspace.ID, newName).
+			Return(models.Artifact{}, artifactNameFreeError(workspace.ID, newName)).
+			Once()
 		activeSession.EXPECT().
 			UpdateArtifactName(mock.Anything, entry.ID, newName).
 			Return(nil).
@@ -73,8 +87,9 @@ func TestManagerRenameArtifact(t *testing.T) {
 		activeSession.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(renamed, nil).Once()
 
 		// No UseDatabaseInTransaction expectation: with an active session the manager must
-		// reuse the caller's transaction, so the write and its read-back stay inside the
-		// caller's unit of work.
+		// reuse the caller's transaction, so the name check, the write, and its read-back all
+		// stay inside the caller's unit of work - and the check sees the same snapshot the
+		// write lands in.
 		got, err := manager.RenameArtifact(
 			context.Background(), entry.ID, newName, activeSession,
 		)
@@ -83,33 +98,97 @@ func TestManagerRenameArtifact(t *testing.T) {
 		assert.Equal(renamed, got)
 	})
 
-	t.Run("surfaces a name collision", func(t *testing.T) {
+	t.Run("reports a name collision as a caller error", func(t *testing.T) {
 		assert := assert.New(t)
 		manager, mocks := newUnitTestManager(t)
 
-		artifactID := ulid.Make().String()
-		dbErr := fmt.Errorf("artifact name already taken")
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "old-name")
+		occupant := sampleArtifact(workspace, "taken")
 
 		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
 		mockDatabase.EXPECT().
-			UpdateArtifactName(mock.Anything, artifactID, "taken").
-			Return(dbErr).
+			GetArtifactByName(mock.Anything, workspace.ID, "taken").
+			Return(occupant, nil).
 			Once()
 		mocks.persistence.EXPECT().
 			UseDatabaseInTransaction(mock.Anything, mock.Anything).
 			RunAndReturn(runTxForManager(mockDatabase)).
 			Once()
 
-		// No GetArtifact expectation: the read-back is reached only after a successful write.
-		// Uniqueness within the workspace is the DB constraint's job, and it surfaces here as
-		// a persistence failure rather than being pre-checked by the manager.
-		got, err := manager.RenameArtifact(context.Background(), artifactID, "taken", nil)
+		// No UpdateArtifactName expectation, and that is the whole point: the write is never
+		// attempted, so the unique index never gets to answer with a raw constraint violation
+		// naming `artifact_workspace_name`. The caller gets a BadInputError instead.
+		got, err := manager.RenameArtifact(context.Background(), entry.ID, "taken", nil)
+
+		assertBadInputError(assert, err)
+		assert.Contains(err.Error(), "already has an artifact named 'taken'")
+		assert.Equal(models.Artifact{}, got)
+	})
+
+	t.Run("treats a rename to the current name as a no-op", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "same-name")
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		// The lookup finds this very artifact. Comparing IDs is what separates that from a real
+		// collision: the row the index would clash with is the row being renamed, so there is
+		// nothing to clash with. Without the ID check this reports the artifact colliding with
+		// itself.
+		mockDatabase.EXPECT().
+			GetArtifactByName(mock.Anything, workspace.ID, "same-name").
+			Return(entry, nil).
+			Once()
+		mockDatabase.EXPECT().
+			UpdateArtifactName(mock.Anything, entry.ID, "same-name").
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		got, err := manager.RenameArtifact(context.Background(), entry.ID, "same-name", nil)
+
+		assert.Nil(err)
+		assert.Equal(entry, got)
+	})
+
+	t.Run("surfaces a failed name check rather than assuming the name is free", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "old-name")
+		dbErr := fmt.Errorf("database is unreachable")
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		mockDatabase.EXPECT().
+			GetArtifactByName(mock.Anything, workspace.ID, "renamed").
+			Return(models.Artifact{}, dbErr).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		// Only not-found means the name is free. Treating any failure that way would let a
+		// database outage fall through to the constraint violation the check exists to replace,
+		// so no UpdateArtifactName is expected here either.
+		got, err := manager.RenameArtifact(context.Background(), entry.ID, "renamed", nil)
 
 		assertManagerPersistenceError(assert, err, dbErr)
 		assert.Equal(models.Artifact{}, got)
 	})
 
-	t.Run("surfaces a read back failure", func(t *testing.T) {
+	t.Run("surfaces a pre-read failure", func(t *testing.T) {
 		assert := assert.New(t)
 		manager, mocks := newUnitTestManager(t)
 
@@ -117,10 +196,6 @@ func TestManagerRenameArtifact(t *testing.T) {
 		dbErr := fmt.Errorf("artifact vanished")
 
 		mockDatabase := mockdb.NewDatabase(t)
-		mockDatabase.EXPECT().
-			UpdateArtifactName(mock.Anything, artifactID, "renamed").
-			Return(nil).
-			Once()
 		mockDatabase.EXPECT().
 			GetArtifact(mock.Anything, artifactID).
 			Return(models.Artifact{}, dbErr).
@@ -130,13 +205,60 @@ func TestManagerRenameArtifact(t *testing.T) {
 			RunAndReturn(runTxForManager(mockDatabase)).
 			Once()
 
-		// The read-back is inside the transaction, so its failure fails the whole call rather
-		// than returning a half-known entry.
+		// Without the parent workspace there is no uniqueness question to ask, so the call
+		// stops here rather than renaming unchecked.
 		got, err := manager.RenameArtifact(context.Background(), artifactID, "renamed", nil)
 
 		assertManagerPersistenceError(assert, err, dbErr)
 		assert.Equal(models.Artifact{}, got)
 	})
+
+	t.Run("surfaces a read back failure", func(t *testing.T) {
+		assert := assert.New(t)
+		manager, mocks := newUnitTestManager(t)
+
+		workspace := sampleWorkspace("test-workspace")
+		entry := sampleArtifact(workspace, "old-name")
+		dbErr := fmt.Errorf("artifact vanished")
+
+		mockDatabase := mockdb.NewDatabase(t)
+		mockDatabase.EXPECT().GetArtifact(mock.Anything, entry.ID).Return(entry, nil).Once()
+		mockDatabase.EXPECT().
+			GetArtifactByName(mock.Anything, workspace.ID, "renamed").
+			Return(models.Artifact{}, artifactNameFreeError(workspace.ID, "renamed")).
+			Once()
+		mockDatabase.EXPECT().
+			UpdateArtifactName(mock.Anything, entry.ID, "renamed").
+			Return(nil).
+			Once()
+		mockDatabase.EXPECT().
+			GetArtifact(mock.Anything, entry.ID).
+			Return(models.Artifact{}, dbErr).
+			Once()
+		mocks.persistence.EXPECT().
+			UseDatabaseInTransaction(mock.Anything, mock.Anything).
+			RunAndReturn(runTxForManager(mockDatabase)).
+			Once()
+
+		// The read-back is inside the transaction, so its failure fails the whole call rather
+		// than returning a half-known entry.
+		got, err := manager.RenameArtifact(context.Background(), entry.ID, "renamed", nil)
+
+		assertManagerPersistenceError(assert, err, dbErr)
+		assert.Equal(models.Artifact{}, got)
+	})
+}
+
+// artifactNameFreeError build the not-found the persistence layer returns for a name no
+// artifact holds - the answer that tells a rename its target name is available.
+//
+// Bare rather than wrapped, unlike the operator's `artifactNotFoundError`: the rename checks
+// through the db client directly, inside the caller's transaction, so no manager layer sits
+// between the two to add wrapping.
+func artifactNameFreeError(workspaceID string, name string) error {
+	return goutils.NewNotFoundError(
+		fmt.Sprintf("artifact '%s/%s' does not exist", workspaceID, name), nil, true,
+	)
 }
 
 // ======================================================================================

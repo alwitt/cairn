@@ -229,8 +229,9 @@ func NewDockerOperator(
 	return instance, nil
 }
 
-// validateWorkspacePath verify a caller-supplied path is absolute and lands inside the
-// workspace volume mount.
+// validateWorkspacePath verify a caller-supplied path is absolute and names a location inside
+// the workspace volume mount - the mount root itself included, which is a directory rather than
+// a file and so is rejected on its own terms.
 //
 // The sidecar performs its own containment check, and that one is authoritative: only it can
 // see the filesystem, so only it can resolve a symlink and judge where a path really leads.
@@ -247,16 +248,27 @@ func validateWorkspacePath(path string) error {
 		)
 	}
 
-	// `Clean` folds any `..` traversal, so the check below sees where the path actually
+	// `Clean` folds any `..` traversal, so the checks below see where the path actually
 	// lands rather than what it was spelled as.
 	cleaned := filepath.Clean(path)
+
+	// Named before the containment check, which would otherwise answer this case with
+	// "'<mount>' is outside '<mount>'" - a contradiction that leaves a caller nothing to act
+	// on. The mount root is not outside the volume; what disqualifies it is that it is the
+	// volume's own directory rather than a file within it. Worded as the sidecar words the
+	// same rejection, so the two gates read alike.
+	if cleaned == models.WorkspaceMountPath {
+		return goutils.NewBadInputError(
+			fmt.Sprintf(
+				"path '%s' is the workspace volume mount point itself, not a file within it",
+				path,
+			), nil, true,
+		)
+	}
 
 	// The trailing separator is load-bearing: without it a sibling whose name merely starts
 	// with the mount's - `/mnt/cairn/wsX` - would read as a match. Comparing against
 	// `<mount>/` makes this a path-component test rather than a string-prefix one.
-	//
-	// The mount root itself fails here too, correctly: it is a directory, never a file to
-	// read or write.
 	if !strings.HasPrefix(cleaned, models.WorkspaceMountPath+string(filepath.Separator)) {
 		return goutils.NewBadInputError(
 			fmt.Sprintf(
