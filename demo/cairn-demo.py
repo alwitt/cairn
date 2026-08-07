@@ -31,6 +31,10 @@ Examples:
     ./cairn-demo.py get artifact -w my-ws report --presign
     ./cairn-demo.py update artifact -w my-ws -a report ./report-v2.pdf
     ./cairn-demo.py delete artifact -w my-ws report
+
+    ./cairn-demo.py volume download -w my-ws -a report /mnt/cairn/ws/out/report.bin
+    ./cairn-demo.py volume upload -w my-ws --name report /mnt/cairn/ws/report.bin
+    ./cairn-demo.py volume update -w my-ws -a report /mnt/cairn/ws/report-v2.bin
 """
 
 import base64
@@ -39,6 +43,7 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import PurePosixPath
 
 import click
 import requests
@@ -79,6 +84,11 @@ DEFAULT_TIMEOUT_SECS = 30
 # Volume provisioning and teardown are synchronous - the handler returns only once Docker is
 # done - so those two calls need far more headroom than a metadata update.
 VOLUME_TIMEOUT_SECS = 300
+# The volume transfer endpoints run sidecars synchronously, and the handler returns only once
+# they are done. The two upload directions run a pair in series - stat/hash, then transfer - each
+# bounded by the deployment's own sidecar timeout (120s in demo/server_config.yml), so the client
+# budget has to clear their sum with room left for an image pull on a cold host.
+VOLUME_TRANSFER_TIMEOUT_SECS = 600
 # Object store transfer timeouts, matching the sidecar's (sidecar/cairn_sidecar/transfer.py):
 # a hung object store should fail the command rather than hang forever.
 UPLOAD_CONNECT_TIMEOUT_SECS = 30
@@ -129,6 +139,11 @@ def workspace_artifacts_url(base_url, workspace_id):
     return f"{workspace_url(base_url, workspace_id)}/artifacts"
 
 
+def workspace_artifact_from_volume_url(base_url, workspace_id):
+    """Save-from-volume endpoint: /v1/workspaces/{workspaceID}/artifact-from-volume"""
+    return f"{workspace_url(base_url, workspace_id)}/artifact-from-volume"
+
+
 def artifact_url(base_url, artifact_id):
     """Single artifact endpoint: /v1/artifacts/{artifactID}"""
     return f"{base_url.rstrip('/')}/v1/artifacts/{artifact_id}"
@@ -137,6 +152,16 @@ def artifact_url(base_url, artifact_id):
 def artifact_content_url(base_url, artifact_id):
     """Artifact content replacement endpoint: /v1/artifacts/{artifactID}/content"""
     return f"{artifact_url(base_url, artifact_id)}/content"
+
+
+def artifact_load_in_volume_url(base_url, artifact_id):
+    """Load-into-volume endpoint: /v1/artifacts/{artifactID}/load-in-volume"""
+    return f"{artifact_url(base_url, artifact_id)}/load-in-volume"
+
+
+def artifact_update_from_volume_url(base_url, artifact_id):
+    """Update-from-volume endpoint: /v1/artifacts/{artifactID}/update-from-volume"""
+    return f"{artifact_url(base_url, artifact_id)}/update-from-volume"
 
 
 # ======================================================================================
@@ -430,6 +455,33 @@ def _prompt_workspace_name(message):
         ),
         validate_while_typing=False,
     ).strip()
+
+
+def validate_volume_path(ctx, param, value):  # pylint: disable=unused-argument
+    """Click callback rejecting a path that does not name a location inside the volume mount.
+
+    These paths are resolved inside the sidecar's mount, not on this host, so `click.Path` is
+    the wrong type for them - the file is not here to be checked. What can be checked cheaply
+    is the shape the server demands (api/artifact.go): absolute, and within the mount.
+
+    This is a convenience mirror, not the enforcement point, and deliberately the weaker of the
+    two checks. It is purely lexical: `..` is not normalized away, so a path like
+    `/mnt/cairn/ws/../../etc/passwd` passes here and is caught server side, which resolves it,
+    follows symlinks, and reports what it actually resolved to. Failing early only turns the
+    obvious round-trip 400 into an immediate message; it never decides the boundary.
+    """
+    path = PurePosixPath(value)
+    if not path.is_absolute():
+        raise click.BadParameter(f"must be an absolute path, got '{value}'")
+
+    # `is_relative_to` also accepts the mount itself, which is a directory - the server refuses
+    # it on its own grounds, and that is a better error than one invented here.
+    if not path.is_relative_to(WORKSPACE_MOUNT_PATH):
+        raise click.BadParameter(
+            f"must be within the workspace volume mount ({WORKSPACE_MOUNT_PATH}), got '{value}'"
+        )
+
+    return value
 
 
 def interactive(flow, *args):
@@ -892,6 +944,117 @@ def teardown_workspace(ctx, name):
         "delete",
         workspace_volume_url(base_url, workspace_id),
         timeout=VOLUME_TIMEOUT_SECS,
+    )
+    show(resp)
+
+
+# ======================================================================================
+# volume transfer
+#
+# The other direction from the staging path `create artifact` and `update artifact` take. There
+# the client holds the bytes and sends them to the object store itself; here cairn moves them,
+# running sidecars that mount the workspace volume, and the client only names a path (DESIGN
+# §6.4 for the two upload directions, §7.5.1 for the download). Every path below is resolved
+# inside that mount, never on this host.
+
+
+@cli.group("volume")
+def volume_group():
+    """Move artifact content through a workspace's persistent volume."""
+
+
+@volume_group.command("download")
+@click.option(
+    "-w", "--workspace", required=True, help="Workspace holding the artifact."
+)
+@click.option("-a", "--artifact", required=True, help="Name of the artifact to fetch.")
+@click.argument("target_path", callback=validate_volume_path)
+@click.pass_context
+def volume_download(ctx, workspace, artifact, target_path):
+    """Download an artifact's content into its workspace's persistent volume.
+
+    The target's parent directory must already exist. cairn never creates intermediate
+    directories, deliberately (DESIGN §7.5.1) - `open workspace` is where you mkdir one.
+
+    At the target itself: an existing file is overwritten, a symlink is replaced rather than
+    followed, and a directory is refused. The reply is the bare response envelope, with no
+    artifact in it - use `open workspace` to see what landed.
+    """
+    base_url = ctx.obj["base_url"]
+    workspace_id = resolve_workspace_id(base_url, workspace)
+    artifact_id = resolve_artifact_id(base_url, workspace_id, workspace, artifact)
+
+    resp = call(
+        "post",
+        artifact_load_in_volume_url(base_url, artifact_id),
+        json={"target_path": target_path},
+        timeout=VOLUME_TRANSFER_TIMEOUT_SECS,
+    )
+    show(resp)
+
+
+@volume_group.command("upload")
+@click.option("-w", "--workspace", required=True, help="Workspace to upload into.")
+@click.option(
+    "--name", required=True, help="Artifact name; see --help for the charset."
+)
+@click.option("--description", default=None, help="Optional artifact description.")
+@click.argument("source_path", callback=validate_volume_path)
+@click.pass_context
+def volume_upload(ctx, workspace, name, description, source_path):
+    """Save a file already in the workspace volume as a new artifact.
+
+    --name is required rather than derived from the filename, for the reason `create artifact`
+    gives: names may only contain alphanumerics, '-' and '_', so a basename carrying an
+    extension would be rejected and any rule for stripping one would just be a guess.
+
+    Unlike `create artifact` the description is a flag here, not a prompt, so a whole transfer
+    round trip can be scripted. Reusing a name already taken in the workspace fails.
+    """
+    base_url = ctx.obj["base_url"]
+    workspace_id = resolve_workspace_id(base_url, workspace)
+
+    payload = {"source_path": source_path, "name": name}
+    if description:
+        payload["description"] = description
+
+    resp = call(
+        "post",
+        workspace_artifact_from_volume_url(base_url, workspace_id),
+        json=payload,
+        timeout=VOLUME_TRANSFER_TIMEOUT_SECS,
+    )
+    show(resp)
+
+
+@volume_group.command("update")
+@click.option(
+    "-w", "--workspace", required=True, help="Workspace holding the artifact."
+)
+@click.option(
+    "-a", "--artifact", required=True, help="Name of the artifact to replace."
+)
+@click.argument("source_path", callback=validate_volume_path)
+@click.pass_context
+def volume_update(ctx, workspace, artifact, source_path):
+    """Replace an artifact's content with a file already in the workspace volume.
+
+    The name and description stay as they were; only the content moves. Concurrent updates are
+    last writer wins, as on the staging path.
+
+    This is the volume-side repair path for an artifact quarantined as MISSING_OBJECT, the
+    counterpart to what `update artifact` does from a local file: giving it an object again
+    returns it to RECORDED.
+    """
+    base_url = ctx.obj["base_url"]
+    workspace_id = resolve_workspace_id(base_url, workspace)
+    artifact_id = resolve_artifact_id(base_url, workspace_id, workspace, artifact)
+
+    resp = call(
+        "post",
+        artifact_update_from_volume_url(base_url, artifact_id),
+        json={"source_path": source_path},
+        timeout=VOLUME_TRANSFER_TIMEOUT_SECS,
     )
     show(resp)
 

@@ -35,7 +35,7 @@ workspace:
 artifact:
   s3:
     clientTTL: 1800
-    endpoint: 127.0.0.1:9100
+    endpoint: cairn-dev-s3.local-stack.org:9100
     useTLS: false
 
   store:
@@ -50,4 +50,4 @@ artifact:
   sidecar:
     image: alwitt/cairn-sidecar:latest
     timeoutSecs: 120
-    networkMode: bridge
+    networkMode: cairn-dev

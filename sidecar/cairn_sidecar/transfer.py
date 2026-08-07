@@ -164,7 +164,7 @@ def upload_file(
             # Passing the file object streams it; requests does not buffer the body.
             response = requests.put(
                 signed.url,
-                data=handle,
+                data=b"" if signed.object_size < 1 else handle,
                 headers=headers,
                 timeout=(_CONNECT_TIMEOUT_SECS, _READ_TIMEOUT_SECS),
             )
