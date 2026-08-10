@@ -9,6 +9,7 @@ import (
 
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
+	taskingModel "github.com/alwitt/tasking/models"
 	"github.com/apex/log"
 	"github.com/go-playground/validator/v10"
 )
@@ -206,4 +207,51 @@ func (o *operatorImpl) reportSweepFailure(ctx context.Context, sweep string, err
 	// treated as transient here.
 	var sqlErr goutils.SQLError
 	return errors.As(err, &sqlErr)
+}
+
+// taskingWrapper a basic wrapper around the Operator which can be handed over to the
+// tasking Task Engine for processing maintenance tasks
+type taskingWrapper struct {
+	core Operator
+}
+
+/*
+ProcessTaskExecution process a task specific to this processor
+
+Runs one iteration of the maintenance loop.
+
+The timestamp is taken here rather than carried on the task. Every sweep's grace window is
+measured back from it, and an execution instance can be enqueued well before a worker picks it
+up - longer still when the instance is a retry - so a stamp fixed at submission would judge the
+iteration against a cutoff that had since gone stale. Deriving it at execution is what keeps
+the sweep level-triggered: what it reclaims follows from the state it finds, not from when it
+was asked for.
+
+A failure is reported as non-recoverable, which opts it out of the task's retry policy. That is
+not a claim that maintenance cannot be retried - it follows from what `PerformMaintenance` returns.
+Everything a later attempt could plausibly get past is already absorbed there and logged: an
+unreachable object store, a docker daemon that went away. What reaches here is a failure of
+cairn's own database, which is the one fault the loop is not meant to spin against (see DESIGN
+§8.3.2). Note this is a weaker remedy than the halt that section describes - the failure is
+recorded against the task rather than taking the process down, and the next scheduled iteration
+still fires, re-deriving the whole sweep from durable state.
+
+	@param ctx context.Context - execution context
+	@param taskEntry Task - task entry
+	@param executeEntry TaskExecution - task execution instance
+*/
+func (t taskingWrapper) ProcessTaskExecution(
+	ctx context.Context, taskEntry taskingModel.Task, executeEntry taskingModel.TaskExecution,
+) error {
+	if err := t.core.PerformMaintenance(ctx, time.Now().UTC()); err != nil {
+		return taskingModel.NewNonRecoverableError(
+			fmt.Sprintf(
+				"maintenance iteration failed during task %s execution %s",
+				taskEntry.ID,
+				executeEntry.ID,
+			), err, true,
+		)
+	}
+
+	return nil
 }

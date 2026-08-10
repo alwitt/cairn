@@ -173,7 +173,11 @@ func BuildNewServer(parentCtx context.Context, configs models.ApplicationConfig)
 	if err != nil {
 		return nil, models.NewBootStrapError("Failed to parse DB persistence parameters", err, true)
 	}
-	persistence, err := db.NewConnection(psqlDial, logger.Error)
+	sqlLogLevel := logger.Error
+	if configs.Persistence.SQL.Application.DebugLog {
+		sqlLogLevel = logger.Info
+	}
+	persistence, err := db.NewConnection(psqlDial, sqlLogLevel)
 	if err != nil {
 		return nil, models.NewBootStrapError("Failed to prepare DB persistence client", err, true)
 	}

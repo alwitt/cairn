@@ -11,6 +11,7 @@ import (
 	mockmaintenance "github.com/alwitt/cairn/mocks/maintenance"
 	"github.com/alwitt/cairn/models"
 	"github.com/alwitt/goutils"
+	taskingModel "github.com/alwitt/tasking/models"
 	"github.com/apex/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -354,5 +355,85 @@ func TestPerformMaintenance(t *testing.T) {
 		expectStagingSweep(manager, maintenance.StagingReapReport{}, failure)
 
 		assert.Equal(failure, operator.PerformMaintenance(utCtx, unitTestIterationTime))
+	})
+}
+
+/*
+TestProcessTaskExecution validates the adapter that lets the Task Engine drive a maintenance
+iteration.
+
+It is a thin thing, but both halves of it are load bearing: where the iteration's timestamp comes
+from, and how a failure is dispositioned. Getting either wrong produces no error and no log - just
+a maintenance loop that reclaims nothing, or one that retries a broken database in a tight cycle.
+*/
+func TestProcessTaskExecution(t *testing.T) {
+	utCtx := context.Background()
+
+	// A task defined long before this execution, which is the state any retried or delayed
+	// instance is in by the time a worker picks it up.
+	staleTask := taskingModel.Task{
+		ID:        "01JQTASK",
+		TaskName:  maintenance.MaintenanceTaskName,
+		CreatedAt: time.Date(2021, time.March, 4, 5, 6, 7, 0, time.UTC),
+	}
+	execution := taskingModel.TaskExecution{
+		ID:        "01JQEXEC",
+		TaskID:    staleTask.ID,
+		CreatedAt: staleTask.CreatedAt,
+	}
+
+	// Case 1: a successful iteration reports success, and the instant it is judged at is derived
+	// here rather than carried on the task. Every sweep's grace window is measured back from it,
+	// so a stamp fixed at submission would have a long-queued instance reclaiming against a
+	// cutoff that had gone stale - and would do so silently.
+	t.Run("runs an iteration at the current instant", func(t *testing.T) {
+		assert := assert.New(t)
+
+		processor, operator := newUnitTestTaskProcessor(t)
+
+		before := time.Now().UTC()
+		var observed time.Time
+		operator.EXPECT().
+			PerformMaintenance(mock.Anything, mock.Anything).
+			RunAndReturn(func(_ context.Context, timestamp time.Time) error {
+				observed = timestamp
+				return nil
+			}).
+			Once()
+
+		assert.Nil(processor.ProcessTaskExecution(utCtx, staleTask, execution))
+
+		assert.False(observed.Before(before), "the iteration must be judged at the current instant")
+		assert.NotEqual(staleTask.CreatedAt, observed, "the task's own timestamp must not be reused")
+	})
+
+	// Case 2: a failure is dispositioned non-retryable. What reaches here is a failure of cairn's
+	// own database - `PerformMaintenance` absorbs everything else - and retrying that against the
+	// same database within the same window achieves nothing the next iteration would not.
+	t.Run("reports a failure as non-recoverable", func(t *testing.T) {
+		assert := assert.New(t)
+
+		processor, operator := newUnitTestTaskProcessor(t)
+
+		failure := databaseFailure()
+		operator.EXPECT().
+			PerformMaintenance(mock.Anything, mock.Anything).
+			Return(failure).
+			Once()
+
+		err := processor.ProcessTaskExecution(utCtx, staleTask, execution)
+		assert.NotNil(err)
+
+		var nonRecoverable taskingModel.NonRecoverableError
+		assert.True(
+			errors.As(err, &nonRecoverable),
+			"expected NonRecoverableError, got %T: %v", err, err,
+		)
+
+		// The disposition must not cost the diagnosis: an operator reading the recorded failure
+		// still needs to see which database call went wrong.
+		var sqlErr goutils.SQLError
+		assert.True(errors.As(err, &sqlErr), "the underlying cause must survive the wrapping")
+		assert.Contains(err.Error(), failure.Error())
 	})
 }

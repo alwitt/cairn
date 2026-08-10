@@ -31,11 +31,14 @@ func unitTestStoreConfig() models.ArtifactStorageConfig {
 	}
 }
 
-// unitTestMaintenanceConfig a valid maintenance config, the shape NewManager must accept.
+// unitTestMaintenanceConfig a valid maintenance config, the shape NewManager must accept. The
+// three windows are given distinct values, so a test asserting one of them reached its consumer
+// cannot pass against another.
 func unitTestMaintenanceConfig() models.MaintenanceConfig {
 	return models.MaintenanceConfig{
 		MaintenanceSweepIntSec:  60,
 		OrphanedObjectAgeOutSec: 3600,
+		TerminalTaskAgeOutSec:   7200,
 	}
 }
 
@@ -190,10 +193,16 @@ func TestNewManager(t *testing.T) {
 	t.Run("rejects an invalid maintenance config", func(t *testing.T) {
 		assert := assert.New(t)
 
-		for _, broken := range []models.MaintenanceConfig{
-			{MaintenanceSweepIntSec: 0, OrphanedObjectAgeOutSec: 3600},
-			{MaintenanceSweepIntSec: 60, OrphanedObjectAgeOutSec: 0},
+		// One field zeroed per entry, off an otherwise valid config, so the case that fails names
+		// the one window that was not accepted.
+		for name, corrupt := range map[string]func(*models.MaintenanceConfig){
+			"sweep interval":        func(c *models.MaintenanceConfig) { c.MaintenanceSweepIntSec = 0 },
+			"object grace window":   func(c *models.MaintenanceConfig) { c.OrphanedObjectAgeOutSec = 0 },
+			"task retention window": func(c *models.MaintenanceConfig) { c.TerminalTaskAgeOutSec = 0 },
 		} {
+			broken := unitTestMaintenanceConfig()
+			corrupt(&broken)
+
 			manager, err := maintenance.NewManager(
 				unitTestAppName,
 				mockdb.NewClient(t),
@@ -203,7 +212,7 @@ func TestNewManager(t *testing.T) {
 				mockruntime.NewVolumeManager(t),
 			)
 			assert.Nil(manager)
-			assert.NotNil(err, "maintenance config %+v should be rejected", broken)
+			assert.NotNil(err, "a zero %s should be rejected", name)
 		}
 	})
 }

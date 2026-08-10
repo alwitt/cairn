@@ -6,8 +6,15 @@ package mocktest
 
 import (
 	"context"
+	"sync"
 
+	"github.com/alwitt/goutils"
+	"github.com/alwitt/goutils/redis"
 	"github.com/alwitt/goutils/runtime"
+	"github.com/alwitt/tasking/db"
+	"github.com/alwitt/tasking/models"
+	"github.com/alwitt/tasking/task"
+	"github.com/apex/log"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -36,6 +43,80 @@ type UnitTestCallbackCollector_Expecter struct {
 
 func (_m *UnitTestCallbackCollector) EXPECT() *UnitTestCallbackCollector_Expecter {
 	return &UnitTestCallbackCollector_Expecter{mock: &_m.Mock}
+}
+
+// DefineIntervalTimer provides a mock function for the type UnitTestCallbackCollector
+func (_mock *UnitTestCallbackCollector) DefineIntervalTimer(rootCtx context.Context, wg *sync.WaitGroup, logTags log.Fields) (goutils.IntervalTimer, error) {
+	ret := _mock.Called(rootCtx, wg, logTags)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DefineIntervalTimer")
+	}
+
+	var r0 goutils.IntervalTimer
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, *sync.WaitGroup, log.Fields) (goutils.IntervalTimer, error)); ok {
+		return returnFunc(rootCtx, wg, logTags)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, *sync.WaitGroup, log.Fields) goutils.IntervalTimer); ok {
+		r0 = returnFunc(rootCtx, wg, logTags)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(goutils.IntervalTimer)
+		}
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, *sync.WaitGroup, log.Fields) error); ok {
+		r1 = returnFunc(rootCtx, wg, logTags)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// UnitTestCallbackCollector_DefineIntervalTimer_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DefineIntervalTimer'
+type UnitTestCallbackCollector_DefineIntervalTimer_Call struct {
+	*mock.Call
+}
+
+// DefineIntervalTimer is a helper method to define mock.On call
+//   - rootCtx context.Context
+//   - wg *sync.WaitGroup
+//   - logTags log.Fields
+func (_e *UnitTestCallbackCollector_Expecter) DefineIntervalTimer(rootCtx interface{}, wg interface{}, logTags interface{}) *UnitTestCallbackCollector_DefineIntervalTimer_Call {
+	return &UnitTestCallbackCollector_DefineIntervalTimer_Call{Call: _e.mock.On("DefineIntervalTimer", rootCtx, wg, logTags)}
+}
+
+func (_c *UnitTestCallbackCollector_DefineIntervalTimer_Call) Run(run func(rootCtx context.Context, wg *sync.WaitGroup, logTags log.Fields)) *UnitTestCallbackCollector_DefineIntervalTimer_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 *sync.WaitGroup
+		if args[1] != nil {
+			arg1 = args[1].(*sync.WaitGroup)
+		}
+		var arg2 log.Fields
+		if args[2] != nil {
+			arg2 = args[2].(log.Fields)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+		)
+	})
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineIntervalTimer_Call) Return(intervalTimer goutils.IntervalTimer, err error) *UnitTestCallbackCollector_DefineIntervalTimer_Call {
+	_c.Call.Return(intervalTimer, err)
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineIntervalTimer_Call) RunAndReturn(run func(rootCtx context.Context, wg *sync.WaitGroup, logTags log.Fields) (goutils.IntervalTimer, error)) *UnitTestCallbackCollector_DefineIntervalTimer_Call {
+	_c.Call.Return(run)
+	return _c
 }
 
 // DefineSystemCallDockerRuntime provides a mock function for the type UnitTestCallbackCollector
@@ -120,6 +201,270 @@ func (_c *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call) Return(s
 }
 
 func (_c *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call) RunAndReturn(run func(ctx context.Context, name string, command runtime.ContainerCommand, params runtime.DockerRuntimeParams, clearANSIFromOutput bool) (runtime.SystemCallRuntime, error)) *UnitTestCallbackCollector_DefineSystemCallDockerRuntime_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// DefineTaskClient provides a mock function for the type UnitTestCallbackCollector
+func (_mock *UnitTestCallbackCollector) DefineTaskClient(parentCtx context.Context, clientName string, taskCreator string, clientConfig models.TaskClientConfig, dbClient db.Client, redisClient redis.Client) (task.Client, error) {
+	ret := _mock.Called(parentCtx, clientName, taskCreator, clientConfig, dbClient, redisClient)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DefineTaskClient")
+	}
+
+	var r0 task.Client
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string, models.TaskClientConfig, db.Client, redis.Client) (task.Client, error)); ok {
+		return returnFunc(parentCtx, clientName, taskCreator, clientConfig, dbClient, redisClient)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string, models.TaskClientConfig, db.Client, redis.Client) task.Client); ok {
+		r0 = returnFunc(parentCtx, clientName, taskCreator, clientConfig, dbClient, redisClient)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(task.Client)
+		}
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, string, models.TaskClientConfig, db.Client, redis.Client) error); ok {
+		r1 = returnFunc(parentCtx, clientName, taskCreator, clientConfig, dbClient, redisClient)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// UnitTestCallbackCollector_DefineTaskClient_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DefineTaskClient'
+type UnitTestCallbackCollector_DefineTaskClient_Call struct {
+	*mock.Call
+}
+
+// DefineTaskClient is a helper method to define mock.On call
+//   - parentCtx context.Context
+//   - clientName string
+//   - taskCreator string
+//   - clientConfig models.TaskClientConfig
+//   - dbClient db.Client
+//   - redisClient redis.Client
+func (_e *UnitTestCallbackCollector_Expecter) DefineTaskClient(parentCtx interface{}, clientName interface{}, taskCreator interface{}, clientConfig interface{}, dbClient interface{}, redisClient interface{}) *UnitTestCallbackCollector_DefineTaskClient_Call {
+	return &UnitTestCallbackCollector_DefineTaskClient_Call{Call: _e.mock.On("DefineTaskClient", parentCtx, clientName, taskCreator, clientConfig, dbClient, redisClient)}
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskClient_Call) Run(run func(parentCtx context.Context, clientName string, taskCreator string, clientConfig models.TaskClientConfig, dbClient db.Client, redisClient redis.Client)) *UnitTestCallbackCollector_DefineTaskClient_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 string
+		if args[2] != nil {
+			arg2 = args[2].(string)
+		}
+		var arg3 models.TaskClientConfig
+		if args[3] != nil {
+			arg3 = args[3].(models.TaskClientConfig)
+		}
+		var arg4 db.Client
+		if args[4] != nil {
+			arg4 = args[4].(db.Client)
+		}
+		var arg5 redis.Client
+		if args[5] != nil {
+			arg5 = args[5].(redis.Client)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+			arg5,
+		)
+	})
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskClient_Call) Return(client task.Client, err error) *UnitTestCallbackCollector_DefineTaskClient_Call {
+	_c.Call.Return(client, err)
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskClient_Call) RunAndReturn(run func(parentCtx context.Context, clientName string, taskCreator string, clientConfig models.TaskClientConfig, dbClient db.Client, redisClient redis.Client) (task.Client, error)) *UnitTestCallbackCollector_DefineTaskClient_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// DefineTaskReceiver provides a mock function for the type UnitTestCallbackCollector
+func (_mock *UnitTestCallbackCollector) DefineTaskReceiver(parentCtx context.Context, receiverConfig models.TaskReceiverConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB) (task.Receiver, error) {
+	ret := _mock.Called(parentCtx, receiverConfig, dbClient, redisClient, onFatalCB)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DefineTaskReceiver")
+	}
+
+	var r0 task.Receiver
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.TaskReceiverConfig, db.Client, redis.Client, models.OnFatalCB) (task.Receiver, error)); ok {
+		return returnFunc(parentCtx, receiverConfig, dbClient, redisClient, onFatalCB)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.TaskReceiverConfig, db.Client, redis.Client, models.OnFatalCB) task.Receiver); ok {
+		r0 = returnFunc(parentCtx, receiverConfig, dbClient, redisClient, onFatalCB)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(task.Receiver)
+		}
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, models.TaskReceiverConfig, db.Client, redis.Client, models.OnFatalCB) error); ok {
+		r1 = returnFunc(parentCtx, receiverConfig, dbClient, redisClient, onFatalCB)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// UnitTestCallbackCollector_DefineTaskReceiver_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DefineTaskReceiver'
+type UnitTestCallbackCollector_DefineTaskReceiver_Call struct {
+	*mock.Call
+}
+
+// DefineTaskReceiver is a helper method to define mock.On call
+//   - parentCtx context.Context
+//   - receiverConfig models.TaskReceiverConfig
+//   - dbClient db.Client
+//   - redisClient redis.Client
+//   - onFatalCB models.OnFatalCB
+func (_e *UnitTestCallbackCollector_Expecter) DefineTaskReceiver(parentCtx interface{}, receiverConfig interface{}, dbClient interface{}, redisClient interface{}, onFatalCB interface{}) *UnitTestCallbackCollector_DefineTaskReceiver_Call {
+	return &UnitTestCallbackCollector_DefineTaskReceiver_Call{Call: _e.mock.On("DefineTaskReceiver", parentCtx, receiverConfig, dbClient, redisClient, onFatalCB)}
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskReceiver_Call) Run(run func(parentCtx context.Context, receiverConfig models.TaskReceiverConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB)) *UnitTestCallbackCollector_DefineTaskReceiver_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 models.TaskReceiverConfig
+		if args[1] != nil {
+			arg1 = args[1].(models.TaskReceiverConfig)
+		}
+		var arg2 db.Client
+		if args[2] != nil {
+			arg2 = args[2].(db.Client)
+		}
+		var arg3 redis.Client
+		if args[3] != nil {
+			arg3 = args[3].(redis.Client)
+		}
+		var arg4 models.OnFatalCB
+		if args[4] != nil {
+			arg4 = args[4].(models.OnFatalCB)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+		)
+	})
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskReceiver_Call) Return(receiver task.Receiver, err error) *UnitTestCallbackCollector_DefineTaskReceiver_Call {
+	_c.Call.Return(receiver, err)
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskReceiver_Call) RunAndReturn(run func(parentCtx context.Context, receiverConfig models.TaskReceiverConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB) (task.Receiver, error)) *UnitTestCallbackCollector_DefineTaskReceiver_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// DefineTaskScheduler provides a mock function for the type UnitTestCallbackCollector
+func (_mock *UnitTestCallbackCollector) DefineTaskScheduler(parentCtx context.Context, schedulerConfig models.TaskSchedulerConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB) (task.Scheduler, error) {
+	ret := _mock.Called(parentCtx, schedulerConfig, dbClient, redisClient, onFatalCB)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DefineTaskScheduler")
+	}
+
+	var r0 task.Scheduler
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.TaskSchedulerConfig, db.Client, redis.Client, models.OnFatalCB) (task.Scheduler, error)); ok {
+		return returnFunc(parentCtx, schedulerConfig, dbClient, redisClient, onFatalCB)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.TaskSchedulerConfig, db.Client, redis.Client, models.OnFatalCB) task.Scheduler); ok {
+		r0 = returnFunc(parentCtx, schedulerConfig, dbClient, redisClient, onFatalCB)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(task.Scheduler)
+		}
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, models.TaskSchedulerConfig, db.Client, redis.Client, models.OnFatalCB) error); ok {
+		r1 = returnFunc(parentCtx, schedulerConfig, dbClient, redisClient, onFatalCB)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// UnitTestCallbackCollector_DefineTaskScheduler_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DefineTaskScheduler'
+type UnitTestCallbackCollector_DefineTaskScheduler_Call struct {
+	*mock.Call
+}
+
+// DefineTaskScheduler is a helper method to define mock.On call
+//   - parentCtx context.Context
+//   - schedulerConfig models.TaskSchedulerConfig
+//   - dbClient db.Client
+//   - redisClient redis.Client
+//   - onFatalCB models.OnFatalCB
+func (_e *UnitTestCallbackCollector_Expecter) DefineTaskScheduler(parentCtx interface{}, schedulerConfig interface{}, dbClient interface{}, redisClient interface{}, onFatalCB interface{}) *UnitTestCallbackCollector_DefineTaskScheduler_Call {
+	return &UnitTestCallbackCollector_DefineTaskScheduler_Call{Call: _e.mock.On("DefineTaskScheduler", parentCtx, schedulerConfig, dbClient, redisClient, onFatalCB)}
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskScheduler_Call) Run(run func(parentCtx context.Context, schedulerConfig models.TaskSchedulerConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB)) *UnitTestCallbackCollector_DefineTaskScheduler_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 models.TaskSchedulerConfig
+		if args[1] != nil {
+			arg1 = args[1].(models.TaskSchedulerConfig)
+		}
+		var arg2 db.Client
+		if args[2] != nil {
+			arg2 = args[2].(db.Client)
+		}
+		var arg3 redis.Client
+		if args[3] != nil {
+			arg3 = args[3].(redis.Client)
+		}
+		var arg4 models.OnFatalCB
+		if args[4] != nil {
+			arg4 = args[4].(models.OnFatalCB)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+		)
+	})
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskScheduler_Call) Return(scheduler task.Scheduler, err error) *UnitTestCallbackCollector_DefineTaskScheduler_Call {
+	_c.Call.Return(scheduler, err)
+	return _c
+}
+
+func (_c *UnitTestCallbackCollector_DefineTaskScheduler_Call) RunAndReturn(run func(parentCtx context.Context, schedulerConfig models.TaskSchedulerConfig, dbClient db.Client, redisClient redis.Client, onFatalCB models.OnFatalCB) (task.Scheduler, error)) *UnitTestCallbackCollector_DefineTaskScheduler_Call {
 	_c.Call.Return(run)
 	return _c
 }

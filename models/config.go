@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/alwitt/goutils"
+	goutilsRedis "github.com/alwitt/goutils/redis"
 	"github.com/alwitt/goutils/runtime"
 	"github.com/spf13/viper"
 )
@@ -123,7 +124,7 @@ type MetricsConfig struct {
 }
 
 // ===============================================================================
-// Persistence Configuration Structures
+// Persistence Configuration Structures - SQL
 
 // PostgresSSLConfig Postgres connection SSL config
 type PostgresSSLConfig struct {
@@ -155,12 +156,47 @@ type PostgresConfig struct {
 type SQLPersistenceConfig struct {
 	// Application SQL persistence config
 	Application PostgresConfig `mapstructure:"app" json:"app" validate:"required"`
+
+	// TaskEngine the `tasking` Task Engine's SQL persistence config.
+	//
+	// Its own entry rather than a reuse of the application's: the engine's schema is defined and
+	// migrated by `tasking`, not by this repo's `migrations`, so the two have separate migration
+	// histories and nothing here should assume they can be applied together. Pointing both at the
+	// same server, or even the same database, remains a deployment's choice - what this makes
+	// possible is separating them without a code change.
+	TaskEngine PostgresConfig `mapstructure:"tasking" json:"tasking" validate:"required"`
 }
+
+// ===============================================================================
+// Persistence Configuration Structures - REDIS
+
+// RedisConnectionConfig connection parameter to Redis server
+type RedisConnectionConfig struct {
+	// Host of the server
+	Host string `mapstructure:"host" json:"host" validate:"required"`
+	// Port of the server
+	Port uint16 `mapstructure:"port" json:"port"`
+	// DBNumber number of the REDIS database
+	DBNumber uint32 `mapstructure:"dbNumber" json:"dbNumber" validate:"lte=15"`
+}
+
+// ToStandard convert to goutilsRedis.ConnectionConfig
+func (c RedisConnectionConfig) ToStandard() goutilsRedis.ConnectionConfig {
+	return goutilsRedis.ConnectionConfig{
+		Host: c.Host, Port: c.Port, DBNumber: c.DBNumber,
+	}
+}
+
+// ===============================================================================
+// Persistence Configuration Structures - Aggregate
 
 // PersistenceConfig application persistence config
 type PersistenceConfig struct {
 	// SQL persistence config
 	SQL SQLPersistenceConfig `mapstructure:"sql" json:"sql" validate:"required"`
+
+	// Redis connection config.
+	Redis RedisConnectionConfig `mapstructure:"redis" json:"redis" validate:"required"`
 }
 
 // ======================================================================================
@@ -401,6 +437,44 @@ type ArtifactManagerConfig struct {
 }
 
 // ======================================================================================
+// Task Engine Config
+
+/*
+TaskEngineConfig `tasking` Task Engine config.
+
+Process wide rather than per feature. One scheduler and one worker serve the whole deployment,
+and every task the process ever runs is routed by them, so these settings belong to no single
+consumer of the engine - maintenance is merely the first.
+*/
+type TaskEngineConfig struct {
+	// WorkerName identity of this process's Task Engine worker.
+	//
+	// Load bearing across restarts, not a label. A worker claims execution instances under this
+	// name, and on startup reclaims the instances the same name owned before - which is how work
+	// interrupted by a restart is picked back up. So it must be UNIQUE PER REPLICA and STABLE
+	// ACROSS THAT REPLICA'S RESTARTS. Two replicas sharing one name reclaim each other's
+	// in-flight work; a name that changes every boot strands whatever the previous boot held.
+	WorkerName string `mapstructure:"workerName" json:"workerName" validate:"required,valid_name"`
+
+	// SchedulerQueue the IPC queue the Task Engine scheduler listens on. Every component in the
+	// deployment - worker, scheduler, and any client submitting work - must name the same queue,
+	// or a submission is posted where nothing is reading.
+	SchedulerQueue string `mapstructure:"schedulerQueue" json:"schedulerQueue" validate:"required,valid_name"`
+
+	// TaskQueue the task execution queue this process's worker serves, and the queue the
+	// scheduler dispatches this deployment's tasks to.
+	TaskQueue string `mapstructure:"taskQueue" json:"taskQueue" validate:"required,valid_name"`
+
+	// SchedulerMaintenanceIntSec number of seconds between the scheduler's own maintenance
+	// sweeps - the engine's internal backstop for timed out and stalled executions, unrelated to
+	// cairn's maintenance loop.
+	//
+	// The floor mirrors what `tasking` itself enforces, so a value it would refuse is reported
+	// here against this field's name rather than from inside the library constructor.
+	SchedulerMaintenanceIntSec int `mapstructure:"schedulerMaintenanceIntSec" json:"schedulerMaintenanceIntSec" validate:"required,gte=10"`
+}
+
+// ======================================================================================
 // Maintenance Config
 
 // MaintenanceConfig maintenance system config
@@ -411,6 +485,15 @@ type MaintenanceConfig struct {
 	// OrphanedObjectAgeOutSec number of seconds after which an orphaned object will be deleted from
 	// the object store
 	OrphanedObjectAgeOutSec int `mapstructure:"objAgeOutSec" json:"objAgeOutSec" validate:"required,gt=0"`
+
+	// TerminalTaskAgeOutSec number of seconds a finished maintenance task is kept before it is
+	// deleted from the Task Engine's database.
+	//
+	// Every sweep leaves a task entry behind, so without this the engine's database grows for
+	// the life of the deployment. What the window buys is the record itself: an operator looking
+	// into why a sweep did not do what they expected has this long to find the task, its failure,
+	// and its execution history before it is cleared.
+	TerminalTaskAgeOutSec int `mapstructure:"taskAgeOutSec" json:"taskAgeOutSec" validate:"required,gt=0"`
 }
 
 // MaintenanceSweepInt convert MaintenanceSweepIntSec to time.Duration
@@ -421,6 +504,11 @@ func (c MaintenanceConfig) MaintenanceSweepInt() time.Duration {
 // OrphanedObjectAgeOut convert OrphanedObjectAgeOutSec to time.Duration
 func (c MaintenanceConfig) OrphanedObjectAgeOut() time.Duration {
 	return time.Second * time.Duration(c.OrphanedObjectAgeOutSec)
+}
+
+// TerminalTaskAgeOut convert TerminalTaskAgeOutSec to time.Duration
+func (c MaintenanceConfig) TerminalTaskAgeOut() time.Duration {
+	return time.Second * time.Duration(c.TerminalTaskAgeOutSec)
 }
 
 // ======================================================================================
@@ -445,6 +533,9 @@ type ApplicationConfig struct {
 
 	// Artifact artifact configuration
 	Artifact ArtifactManagerConfig `mapstructure:"artifact" json:"artifact" validate:"required"`
+
+	// TaskEngine `tasking` Task Engine configuration
+	TaskEngine TaskEngineConfig `mapstructure:"tasking" json:"tasking" validate:"required"`
 
 	// Maintenance maintenance system configuration
 	Maintenance MaintenanceConfig `mapstructure:"maintenance" json:"maintenance" validate:"required"`
@@ -498,6 +589,21 @@ func InstallDefaultServerConfigValues() {
 	// that moves the database off the host is the one that turns this on. The password is not a
 	// config key at all - it is supplied out of band and handed to GetPostgresDialector.
 	viper.SetDefault("persistence.sql.app.ssl.enabled", false)
+
+	// Default Task Engine persistence config. Same server as the application's by default, a
+	// different database - which is the arrangement the two separate migration histories want,
+	// while still being one Postgres to stand up for development.
+	viper.SetDefault("persistence.sql.tasking.debugLog", false)
+	viper.SetDefault("persistence.sql.tasking.host", "127.0.0.1")
+	viper.SetDefault("persistence.sql.tasking.port", 5432)
+	viper.SetDefault("persistence.sql.tasking.db", "tasking")
+	viper.SetDefault("persistence.sql.tasking.user", "cairn")
+	viper.SetDefault("persistence.sql.tasking.ssl.enabled", false)
+
+	// Default Redis config
+	viper.SetDefault("persistence.redis.host", "127.0.0.1")
+	viper.SetDefault("persistence.redis.port", 6379)
+	viper.SetDefault("persistence.redis.dbNumber", 0)
 
 	// Default metrics config
 	viper.SetDefault("metrics.metricsEndpoint", "/metrics")
@@ -579,9 +685,25 @@ func InstallDefaultServerConfigValues() {
 	viper.SetDefault("artifact.sidecar.timeoutSecs", defaultSidecarTimeoutSecs)
 	viper.SetDefault("artifact.sidecar.networkMode", DefaultSidecarNetworkMode)
 
+	// Default Task Engine config
+	//
+	// The worker name defaults to a single-instance answer, which is what a development stack
+	// and a one-replica deployment both are. A deployment that scales past one replica has to
+	// override it per replica - see TaskEngineConfig.WorkerName for why sharing one is unsafe.
+	viper.SetDefault("tasking.workerName", "cairn-worker")
+	viper.SetDefault("tasking.schedulerQueue", "cairn-task-scheduler")
+	viper.SetDefault("tasking.taskQueue", "cairn-tasks")
+	// The engine's own backstop sweep. Frequent enough that a timed out execution is noticed
+	// promptly, and far below the maintenance sweep interval below, which it is unrelated to.
+	viper.SetDefault("tasking.schedulerMaintenanceIntSec", 30)
+
 	// Default maintenance config
 	viper.SetDefault("maintenance.sweepIntSec", 300)
 	// The grace window has to comfortably exceed the longest in-flight upload, or a sweep would
 	// flag the staging object of a transfer that is still running (DESIGN §8.2.1).
 	viper.SetDefault("maintenance.objAgeOutSec", 3600)
+	// A day of maintenance history, which is long enough for an operator to look into yesterday's
+	// sweep and short enough that the Task Engine's table stays in the hundreds of rows at the
+	// cadence above.
+	viper.SetDefault("maintenance.taskAgeOutSec", 86400)
 }
