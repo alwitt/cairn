@@ -16,7 +16,6 @@ import (
 	"github.com/alwitt/goutils"
 	"github.com/alwitt/goutils/runtime"
 	"github.com/apex/log"
-	"gorm.io/gorm/logger"
 )
 
 // Server `cairn` server
@@ -169,40 +168,21 @@ func BuildNewServer(parentCtx context.Context, configs models.ApplicationConfig)
 	// Build persistence client
 
 	// Prepare persistence
-	psqlDial, err := db.GetPostgresDialector(configs.Persistence.SQL.Application)
+	persistence, err := buildPersistenceClient(configs.Persistence.SQL.Application)
 	if err != nil {
-		return nil, models.NewBootStrapError("Failed to parse DB persistence parameters", err, true)
-	}
-	sqlLogLevel := logger.Error
-	if configs.Persistence.SQL.Application.DebugLog {
-		sqlLogLevel = logger.Info
-	}
-	persistence, err := db.NewConnection(psqlDial, sqlLogLevel)
-	if err != nil {
-		return nil, models.NewBootStrapError("Failed to prepare DB persistence client", err, true)
+		return nil, err
 	}
 
 	// Prepare S3 client
-	s3Manager, err := goutils.NewS3ClientManager(
-		configs.Artifact.ObjectStore.ToStandard(), configs.Artifact.ObjectStore.ClientTTL(),
-	)
+	s3Manager, err := buildS3ClientManager(configs.Artifact.ObjectStore)
 	if err != nil {
-		return nil, models.NewBootStrapError("Failed to prepare S3 client manager", err, true)
+		return nil, err
 	}
 
 	// Prepare volume manager
-	var volume runtime.VolumeManager
-	switch configs.Workspace.VolumeType {
-	case models.WorkspaceVolumeTypeDocker:
-		volume, err = runtime.NewDockerVolumeManager(parentCtx)
-		if err != nil {
-			return nil, models.NewBootStrapError("Failed to prepare docker volume manager", err, true)
-		}
-
-	default:
-		return nil, models.NewBootStrapError(
-			"Supported persistence volume type '"+string(configs.Workspace.VolumeType)+"'", nil, true,
-		)
+	volume, err := buildVolumeManager(parentCtx, configs.Workspace.VolumeType)
+	if err != nil {
+		return nil, err
 	}
 
 	// ------------------------------------------------------------------------------------

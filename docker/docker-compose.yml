@@ -14,6 +14,20 @@ services:
     networks:
       - cairn_dev
 
+  cairn-tasking-db:
+    container_name: cairn-tasking-db
+    restart: always
+    hostname: "cairn-tasking-postgres"
+    image: "postgres:18"
+    ports:
+      - 127.0.0.1:6542:5432
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=tasking
+      - POSTGRES_PASSWORD=tasking
+    networks:
+      - cairn_dev
+
   cairn-redis:
     container_name: cairn-redis
     restart: unless-stopped
@@ -85,13 +99,13 @@ services:
             if [ -z \"$${ca_path}\" ] && [ -f /opt/tls/ca.crt ]; then ca_path=/opt/tls/ca.crt; fi; \
             case \"$${host}\" in 127.0.0.1|localhost) strict_host=false ;; *) strict_host=true ;; esac; \
             if [ \"$${strict_host}\" = true ] && [ -n \"$${ca_path}\" ]; then \
-              set -- \"$${@}\" --cacert \"$${ca_path}\" --resolve \"$${host}:9000:127.0.0.1\" --resolve \"$${host}:9001:127.0.0.1\"; \
+              set -- \"$${@}\" --cacert \"$${ca_path}\" --resolve \"$${host}:9000:127.0.0.1\" --resolve \"$${host}:9101:127.0.0.1\"; \
             else \
               set -- \"$${@}\" -k; \
             fi; \
           fi; \
-          curl \"$${@}\" \"$${scheme}://$${host}:9000/health\" && \
-          curl \"$${@}\" \"$${scheme}://$${host}:9001/rustfs/console/health\""
+          curl \"$${@}\" \"$${scheme}://$${host}:9100/health\" && \
+          curl \"$${@}\" \"$${scheme}://$${host}:9101/rustfs/console/health\""
         ]
       interval: 30s
       timeout: 10s

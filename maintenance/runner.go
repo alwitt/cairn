@@ -110,6 +110,21 @@ const (
 	maintenanceSourceOnDemand = "on-demand"
 )
 
+/*
+maintenanceTaskMetadata what is recorded on a maintenance task to say what asked for it.
+
+A struct rather than the map this shape reads like, and not by preference: the Task Engine
+validates whatever metadata it is handed with go-playground, which accepts structs and nothing
+else. A map is refused where it is stored rather than where it was built - at submission, on the
+sweep timer's thread - so the struct is what the engine's contract actually asks for.
+
+Serializes to the same object either way; the field tag is what the task entry carries.
+*/
+type maintenanceTaskMetadata struct {
+	// Source what raised the request; one of the maintenanceSource values above
+	Source string `json:"source" validate:"required"`
+}
+
 // Runner maintenance operations runner
 type Runner interface {
 	/*
@@ -798,7 +813,7 @@ func (t *triggerImpl) submitMaintenanceRequest(ctx context.Context, source strin
 		ctx,
 		taskEngine.DefineTaskParams{
 			Name:     MaintenanceTaskName,
-			Metadata: map[string]string{"source": source},
+			Metadata: maintenanceTaskMetadata{Source: source},
 			Deadline: &deadline,
 			Retry:    &retry,
 		},

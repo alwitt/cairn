@@ -11,6 +11,24 @@ persistence:
       db: postgres
       user: cairn
 
+    # Task Engine SQL persistence config, password provided separately.
+    #
+    # Its own server in the development stack, not just its own database: `tasking` defines and
+    # migrates this schema itself, so the two have separate migration histories and `make
+    # dev-migrate` must never be able to reach this one.
+    tasking:
+      debugLog: false
+      host: 127.0.0.1
+      port: 6542
+      db: postgres
+      user: tasking
+
+  # Backs the Task Engine's IPC queues. Only the maintainer entry point reads this today.
+  redis:
+    host: 127.0.0.1
+    port: 3379
+    dbNumber: 0
+
 metrics:
   service:
     listenOn: 127.0.0.1
@@ -51,3 +69,24 @@ artifact:
     image: alwitt/cairn-sidecar:latest
     timeoutSecs: 120
     networkMode: cairn-dev
+
+# `tasking` Task Engine config. One worker and one scheduler serve the deployment, and the
+# maintainer entry point is the process that runs them.
+tasking:
+  # Must be unique per replica and stable across that replica's restarts - a worker reclaims the
+  # execution instances this name held before the last one. A single-instance development stack
+  # gets away with a fixed name.
+  workerName: cairn-local-dev-worker
+  schedulerQueue: cairn-local-dev-task-scheduler
+  taskQueue: cairn-local-dev-tasks
+  schedulerMaintenanceIntSec: 30
+
+# Maintenance system config. The two windows below are shortened well past their defaults so a
+# development session actually sees a sweep run and its finished tasks reaped; a deployment wants
+# the far longer shipped values.
+maintenance:
+  sweepIntSec: 60
+  # The one window NOT shortened. It is what separates an in-flight upload from an orphan, so it
+  # has to stay comfortably clear of the sidecar timeout above.
+  objAgeOutSec: 3600
+  taskAgeOutSec: 300

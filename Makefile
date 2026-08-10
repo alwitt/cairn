@@ -63,9 +63,24 @@ dev-migrate: ## Test apply database migration to DEV Postgres
 	  --env gorm \
 	  --url "postgres://cairn:cairn@localhost:6532/postgres?search_path=public&sslmode=disable"
 
+.PHONY: dev-tasking-migrate
+dev-tasking-migrate: ## Test apply database migration to tasking DEV Postgres using docker image
+	docker run \
+	  --rm \
+	  -it \
+	  --network=cairn-dev \
+	  alwitt/tasking-migration:0.1.0-rc4 \
+	  migrate apply \
+	  --env gorm \
+	  --url "postgres://tasking:tasking@cairn-tasking-postgres:5432/postgres?search_path=public&sslmode=disable"
+
 .PHONY: api
 api: build ## Start local development API server
 	. .env && ./cairn server -c demo/server_config.yml
+
+.PHONY: mtn
+mtn: build ## Start local development maintenance loop
+	. .env && ./cairn mtn -c demo/server_config.yml
 
 .prepare: ## Prepare the project for local development
 	@pip3 install pre-commit

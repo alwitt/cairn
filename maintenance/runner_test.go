@@ -2,7 +2,9 @@ package maintenance_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	taskingModel "github.com/alwitt/tasking/models"
 	taskEngine "github.com/alwitt/tasking/task"
 	"github.com/apex/log"
+	"github.com/go-playground/validator/v10"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -705,6 +708,35 @@ func arrangeUnitTestSubmit(
 	return captured
 }
 
+/*
+assertUnitTestSubmitMetadata check what a submission recorded about itself, the way the Task
+Engine checks it.
+
+The engine validates task metadata with go-playground before storing it, which accepts a struct
+and refuses everything else - so a map, which reads like the natural shape for this, is taken all
+the way to the database layer and rejected there at run time, on the sweep timer's thread. That
+check is repeated here because nothing in the type system performs it: the field it is handed to
+is an `any`.
+
+The source is asserted through the serialized form rather than the struct, since that is what the
+task entry actually carries, and what someone reading the entries later has to make sense of.
+*/
+func assertUnitTestSubmitMetadata(
+	t *testing.T, submitted *taskEngine.DefineTaskParams, source string,
+) {
+	assert := assert.New(t)
+
+	assert.NotNil(submitted.Metadata)
+	assert.Nil(
+		validator.New().Struct(submitted.Metadata),
+		"task metadata must be a struct the Task Engine's own validator accepts",
+	)
+
+	serialized, err := json.Marshal(submitted.Metadata)
+	assert.Nil(err)
+	assert.JSONEq(fmt.Sprintf(`{"source":"%s"}`, source), string(serialized))
+}
+
 // arrangeUnitTestListTerminal capture the query the clean up pass looks for finished tasks with,
 // and choose what it finds. Every tick makes this call, so a case that runs a tick has to arrange
 // it whether or not the clean up is what the case is about.
@@ -991,6 +1023,9 @@ func TestTriggerRequestMaintenance(t *testing.T) {
 		// Nothing is carried for the processor to read - it takes the sweep's timestamp at
 		// execution instead, so an iteration is judged against when it ran.
 		assert.Nil(submitted.Parameters)
+
+		// What did carry: the record of who asked, in a shape the engine will store.
+		assertUnitTestSubmitMetadata(t, submitted, "on-demand")
 	})
 
 	// Case 2: a failed submission still names the task it failed on. The client defines the task
@@ -1050,6 +1085,10 @@ func TestTriggerStartTimer(t *testing.T) {
 		assert.Nil(mocks.timerHandler())
 		assert.Equal(maintenance.MaintenanceTaskName, submitted.Name)
 		assert.NotNil(submitted.Deadline)
+
+		// A tick's request is recorded as the timer's, which is what distinguishes the periodic
+		// sweeps from the ones an operator asked for.
+		assertUnitTestSubmitMetadata(t, submitted, "timer")
 	})
 
 	// Case 3: a failed submission is handed back to the timer rather than absorbed, which is
