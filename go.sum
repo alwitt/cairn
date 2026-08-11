@@ -658,8 +658,8 @@ github.com/ajstarks/svgo v0.0.0-20180226025133-644b8db467af/go.mod h1:K08gAheRH3
 github.com/ajstarks/svgo v0.0.0-20211024235047-1546f124cd8b/go.mod h1:1KcenG0jGWcpt8ov532z81sp/kMMUG485J2InIOyADM=
 github.com/alwitt/goutils v0.12.3-rc4 h1:KjKG1hT+IJzhyEzdb0VCvU79N0aFuEoBTMQxCsauGvI=
 github.com/alwitt/goutils v0.12.3-rc4/go.mod h1:eHQrtCi0Wa0OHPL23Grjh9Ksjjp8/EZVnw1l9MAw6L8=
-github.com/alwitt/tasking v0.1.0-rc4 h1:WLp7Yano6s+24LRnpgvfiJK25Bs3g7tgDWfq5aTkZw0=
-github.com/alwitt/tasking v0.1.0-rc4/go.mod h1:TXJ2Ad84e1PktnbjwyVsbqr2hHQtGw0RfJbZClJz3cw=
+github.com/alwitt/tasking v0.1.0-rc5 h1:4lwZlCbVJNKclm+Bi46E49jM/dgEyZimkUJhTkanwg4=
+github.com/alwitt/tasking v0.1.0-rc5/go.mod h1:TXJ2Ad84e1PktnbjwyVsbqr2hHQtGw0RfJbZClJz3cw=
 github.com/andybalholm/brotli v1.0.4/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
 github.com/antihax/optional v1.0.0/go.mod h1:uupD/76wgC+ih3iEmQUL+0Ugr19nfwCT1kdvxnR2qWY=
 github.com/apache/arrow/go/v10 v10.0.1/go.mod h1:YvhnlEePVnBS4+0z3fhPfUy7W1Ikj0Ih0vcRo/gZ1M0=

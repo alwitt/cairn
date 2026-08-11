@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	ariga.io/atlas-provider-gorm v0.6.1
 	github.com/alwitt/goutils v0.12.3-rc4
-	github.com/alwitt/tasking v0.1.0-rc4
+	github.com/alwitt/tasking v0.1.0-rc5
 	github.com/apex/log v1.9.0
 	github.com/gabriel-vasile/mimetype v1.4.12
 	github.com/go-playground/validator/v10 v10.30.1
