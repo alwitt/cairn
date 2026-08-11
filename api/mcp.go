@@ -392,10 +392,9 @@ const mcpServerVersion = "0.1.0"
 //
 // The mount path is interpolated from the constant rather than written out, so this does not
 // become a second definition of it (see DESIGN §4.4).
-const mcpServerInstructions = `cairn stores durable files, called artifacts, for agent workflows.
-
-A workspace groups two things: a set of artifacts, and optionally one persistent volume that
-tool containers mount at ` + models.WorkspaceMountPath + `.
+const mcpServerInstructions = `cairn stores durable files, called artifacts, for agent workflows
+in workspaces. A workspace groups two things: a set of artifacts, and optionally one persistent
+volume that tool containers mount at ` + models.WorkspaceMountPath + `.
 
 A workspace is the shared scratch space for a scope of work - not for one tool call, and not
 for one agent. A scope of work is whatever unit of activity an operator chose to give a single
