@@ -1,0 +1,12 @@
+# build environment
+FROM golang:1.26-alpine AS build
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o /usr/bin/cairn .
+
+# deploy environment
+FROM alpine
+COPY --from=build /usr/bin/cairn /usr/bin/
+ENTRYPOINT ["/usr/bin/cairn"]

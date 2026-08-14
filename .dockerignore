@@ -1,0 +1,27 @@
+# VCS and CI
+.git
+.github
+.gitlab-ci.yml
+
+# Secrets and local state
+.env
+.env.example
+.prepare
+.test_prepare
+.vscode
+
+# Local build artifacts
+cairn
+*.bin
+tmp/
+.ruff_cache
+
+# Not needed to build the server binary.
+# NOTE: migrations/ and atlas.hcl are deliberately NOT ignored --
+# docker/Dockerfile.migration copies them from this same context.
+mocks/
+test/
+demo/
+sidecar/
+docker/
+*.md
