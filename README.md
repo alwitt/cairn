@@ -2,6 +2,7 @@
 
 > Shared workspaces and durable artifacts for agent tool calls.
 
+[![CICD](https://github.com/alwitt/cairn/actions/workflows/cicd.yaml/badge.svg)](https://github.com/alwitt/cairn/actions/workflows/cicd.yaml)
 [![Go Version](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -17,10 +18,8 @@ volumes** for shared POSIX scratch space, and owns everything in between: the me
 the object-store credentials, presigned-URL minting, volume lifecycle, and the transfer sidecars
 that move bytes between the two.
 
-Its clients — [`multitool`](https://github.com/alwitt/multitool) today,
-[`rest-pty`](https://github.com/alwitt/rest-pty) later — only **mount** volumes. They never touch
-the object store and hold no credentials. The agent itself talks to `cairn`'s own MCP endpoint for
-every artifact operation.
+Its clients only **mount** volumes. They never touch the object store and hold no credentials. The
+agent itself talks to `cairn`'s own MCP endpoint for every artifact operation.
 
 ## Contents
 
@@ -122,7 +121,7 @@ means **at most one workspace can be mounted into a given container**.
  └─────────────┘                          │                              │
  ┌─────────────┐                          │  Owns:                       │
  │  rest-pty   │──── look up workspace ─► │   - Postgres metadata DB     │
- │  (future)   │      mount volume        │   - Object store + creds     │
+ │             │      mount volume        │   - Object store + creds     │
  └─────────────┘                          │   - Presigned URL minting    │
                                           │   - Volume lifecycle         │
                                           │   - Transfer sidecars        │
