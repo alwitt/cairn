@@ -444,9 +444,10 @@ func NewRunner(params NewRunnerParams) (Runner, error) {
 	taskScheduler, err := schedulerFactory(
 		params.ParentCtx,
 		taskingModel.TaskSchedulerConfig{
-			MaintenanceTimerIntSecs: params.TaskEngine.SchedulerMaintenanceIntSec,
-			SchedulerQueue:          params.TaskEngine.SchedulerQueue,
-			TaskQueues:              taskQueues,
+			MaintenanceTimerIntSecs:  params.TaskEngine.SchedulerMaintenanceIntSec,
+			SchedulerQueue:           params.TaskEngine.SchedulerQueue,
+			CancellationGraceIntSecs: params.TaskEngine.TaskCancellationGraceIntSecs,
+			TaskQueues:               taskQueues,
 		},
 		params.Persistence,
 		params.Redis,

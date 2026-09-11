@@ -69,7 +69,7 @@ dev-tasking-migrate: ## Test apply database migration to tasking DEV Postgres us
 	  --rm \
 	  -it \
 	  --network=cairn-dev \
-	  alwitt/tasking-migration:0.1.0-rc4 \
+	  alwitt/tasking-migration:0.2.0-rc1 \
 	  migrate apply \
 	  --env gorm \
 	  --url "postgres://tasking:tasking@cairn-tasking-postgres:5432/postgres?search_path=public&sslmode=disable"

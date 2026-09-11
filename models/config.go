@@ -472,6 +472,10 @@ type TaskEngineConfig struct {
 	// The floor mirrors what `tasking` itself enforces, so a value it would refuse is reported
 	// here against this field's name rather than from inside the library constructor.
 	SchedulerMaintenanceIntSec int `mapstructure:"schedulerMaintenanceIntSec" json:"schedulerMaintenanceIntSec" validate:"required,gte=10"`
+
+	// CancellationGraceIntSecs how long an execution instance may sit CANCELLING, in seconds,
+	// before the scheduler settles it CANCELLED whether or not its worker ever answered.
+	TaskCancellationGraceIntSecs int `mapstructure:"cancellationGraceIntSecs" json:"cancellationGraceIntSecs" validate:"required,gte=10"`
 }
 
 // ======================================================================================
@@ -696,6 +700,7 @@ func InstallDefaultServerConfigValues() {
 	// The engine's own backstop sweep. Frequent enough that a timed out execution is noticed
 	// promptly, and far below the maintenance sweep interval below, which it is unrelated to.
 	viper.SetDefault("tasking.schedulerMaintenanceIntSec", 30)
+	viper.SetDefault("tasking.cancellationGraceIntSecs", 60)
 
 	// Default maintenance config
 	viper.SetDefault("maintenance.sweepIntSec", 300)

@@ -17,6 +17,7 @@ import (
 	mockgoutils "github.com/alwitt/goutils/mocks/goutils"
 	mockgoutilsRedis "github.com/alwitt/goutils/mocks/redis"
 	goutilsRedis "github.com/alwitt/goutils/redis"
+	taskingCommon "github.com/alwitt/tasking/common"
 	taskingDB "github.com/alwitt/tasking/db"
 	mocktaskingDB "github.com/alwitt/tasking/mocks/db"
 	mocktask "github.com/alwitt/tasking/mocks/task"
@@ -37,10 +38,11 @@ import (
 // engine cannot pass by coincidence.
 func unitTestTaskEngineConfig() models.TaskEngineConfig {
 	return models.TaskEngineConfig{
-		WorkerName:                 "unit-test-worker",
-		SchedulerQueue:             "unit-test-scheduler-queue",
-		TaskQueue:                  "unit-test-task-queue",
-		SchedulerMaintenanceIntSec: 30,
+		WorkerName:                   "unit-test-worker",
+		SchedulerQueue:               "unit-test-scheduler-queue",
+		TaskQueue:                    "unit-test-task-queue",
+		SchedulerMaintenanceIntSec:   30,
+		TaskCancellationGraceIntSecs: 90,
 	}
 }
 
@@ -211,6 +213,14 @@ func TestNewRunner(t *testing.T) {
 		params.ReceiverFactory = nil
 		params.SchedulerFactory = nil
 
+		mocks.redis.EXPECT().
+			Subscribe(
+				mock.Anything,
+				params.TaskEngine.WorkerName+"/cancel",
+				[]string{taskingCommon.BuildCancelSignalTopicName(params.TaskEngine.SchedulerQueue)},
+			).
+			Return(nil, nil).
+			Once()
 		mocks.redis.EXPECT().
 			GetQueueHandle(mock.Anything, mock.Anything).
 			Return(mockgoutilsRedis.NewQueue(t), nil).

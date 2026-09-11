@@ -80,6 +80,7 @@ tasking:
   schedulerQueue: cairn-local-dev-task-scheduler
   taskQueue: cairn-local-dev-tasks
   schedulerMaintenanceIntSec: 30
+  cancellationGraceIntSecs: 60
 
 # Maintenance system config. The two windows below are shortened well past their defaults so a
 # development session actually sees a sweep run and its finished tasks reaped; a deployment wants
