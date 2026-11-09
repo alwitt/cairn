@@ -29,6 +29,7 @@ Examples:
     ./cairn-demo.py list artifact my-ws --state RECORDED
     ./cairn-demo.py create artifact -w my-ws --name report ./report.pdf
     ./cairn-demo.py get artifact -w my-ws report --presign
+    ./cairn-demo.py get artifact -w my-ws report --store-at ./report.pdf
     ./cairn-demo.py update artifact -w my-ws -a report ./report-v2.pdf
     ./cairn-demo.py delete artifact -w my-ws report
 
@@ -43,7 +44,7 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import click
 import requests
@@ -91,8 +92,10 @@ VOLUME_TIMEOUT_SECS = 300
 VOLUME_TRANSFER_TIMEOUT_SECS = 600
 # Object store transfer timeouts, matching the sidecar's (sidecar/cairn_sidecar/transfer.py):
 # a hung object store should fail the command rather than hang forever.
-UPLOAD_CONNECT_TIMEOUT_SECS = 30
-UPLOAD_READ_TIMEOUT_SECS = 900
+OBJECT_STORE_CONNECT_TIMEOUT_SECS = 30
+OBJECT_STORE_READ_TIMEOUT_SECS = 900
+# Matches the sidecar's download stride (sidecar/cairn_sidecar/transfer.py).
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 # ======================================================================================
@@ -325,7 +328,10 @@ def put_staging_object(put_url, path, size, sha256_b64):
                 put_url,
                 data=b"" if size == 0 else handle,
                 headers=headers,
-                timeout=(UPLOAD_CONNECT_TIMEOUT_SECS, UPLOAD_READ_TIMEOUT_SECS),
+                timeout=(
+                    OBJECT_STORE_CONNECT_TIMEOUT_SECS,
+                    OBJECT_STORE_READ_TIMEOUT_SECS,
+                ),
             )
     # RequestException first: requests.ConnectionError subclasses OSError, and its message
     # embeds the presigned URL. Only the exception type is safe to report.
@@ -383,6 +389,73 @@ def stage_file(base_url, workspace_id, path):
     click.echo(f"Staged at {staging_object_key}", err=True)
 
     return staging_object_key
+
+
+# ======================================================================================
+# Artifact download
+#
+# The mirror of the staging upload: `get artifact` mints a presigned GET alongside the
+# metadata, and the bytes come straight from the object store.
+
+
+def download_object(get_url, path, size):
+    """Download an object from a presigned GET URL into a local file.
+
+    The file is only opened once the object store has answered, so a refused request leaves
+    whatever was at the path alone. After that point any failure removes the file, and so
+    does a byte count that differs from the artifact's recorded size: a short file must not
+    be left behind looking complete.
+
+    Nothing here may print the URL or an exception carrying it (DESIGN §5.2): the signature
+    lives in its query string. That is also why this does not go through `call`, whose
+    failure line quotes both.
+    """
+    click.echo(f"Downloading {size} bytes ...", err=True)
+    try:
+        resp = requests.get(
+            get_url,
+            stream=True,
+            timeout=(OBJECT_STORE_CONNECT_TIMEOUT_SECS, OBJECT_STORE_READ_TIMEOUT_SECS),
+        )
+    except requests.exceptions.RequestException as exc:
+        click.echo(
+            f"Download from the object store failed: {type(exc).__name__}", err=True
+        )
+        sys.exit(1)
+
+    with resp:
+        if not resp.ok:
+            click.echo(f"Object store failure (HTTP {resp.status_code})", err=True)
+            sys.exit(1)
+
+        try:
+            handle = open(path, "wb")  # pylint: disable=consider-using-with
+        except OSError as exc:
+            click.echo(f"Could not write {path}: {exc}", err=True)
+            sys.exit(1)
+
+        failure = None
+        written = 0
+        try:
+            with handle:
+                for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+                    handle.write(chunk)
+                    written += len(chunk)
+        # RequestException first, as in put_staging_object: requests.ConnectionError
+        # subclasses OSError, and its message embeds the presigned URL.
+        except requests.exceptions.RequestException as exc:
+            failure = (
+                f"Download stream failed after {written} bytes: {type(exc).__name__}"
+            )
+        except OSError as exc:
+            failure = f"Could not write {path}: {exc}"
+
+    if failure is None and written != size:
+        failure = f"Downloaded {written} bytes, but the artifact records {size}"
+    if failure is not None:
+        Path(path).unlink(missing_ok=True)
+        click.echo(failure, err=True)
+        sys.exit(1)
 
 
 # ======================================================================================
@@ -672,13 +745,27 @@ def get_workspace(ctx, name):
     "-w", "--workspace", required=True, help="Workspace holding the artifact."
 )
 @click.argument("name")
-@click.option("--presign", is_flag=True, help="Also mint a presigned GET URL.")
+@click.option(
+    "--presign", is_flag=True, help="Also mint and print a presigned GET URL."
+)
+@click.option(
+    "--store-at",
+    type=click.Path(dir_okay=False, writable=True),
+    default=None,
+    help="Download the artifact's content to this file path.",
+)
 @click.option(
     "--ttl", type=int, default=None, help="Requested GET URL lifetime, in seconds."
 )
 @click.pass_context
-def get_artifact(ctx, workspace, name, presign, ttl):
-    """Fetch one artifact by name, optionally with a download URL.
+def get_artifact(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    ctx, workspace, name, presign, store_at, ttl
+):
+    """Fetch one artifact by name, optionally with a download URL or its content.
+
+    --store-at downloads through a presigned GET URL, so it mints one just as --presign
+    does, but the URL is only printed when --presign is given too. The parent directory
+    must already exist, and a file already at the path is overwritten.
 
     --ttl can only shorten the link, never extend it past the deployment's configured
     maximum, which is also the default. Asking to presign an artifact in state
@@ -690,13 +777,25 @@ def get_artifact(ctx, workspace, name, presign, ttl):
     artifact_id = resolve_artifact_id(base_url, workspace_id, workspace, name)
 
     params = {}
-    if presign:
+    if presign or store_at:
         params["presign"] = "true"
     if ttl is not None:
         params["ttl"] = ttl
 
     resp = call("get", artifact_url(base_url, artifact_id), params=params)
-    show(resp)
+    body = decode(resp)
+    get_url = body.get("get_url")
+    if not presign:
+        # The URL carries its signature, so it is only printed for a caller who asked.
+        body.pop("get_url", None)
+    click.echo(json.dumps(body, indent=2))
+    if not resp.ok or not body.get("success", False):
+        fail(resp, body)
+
+    if store_at:
+        size = body["artifact"]["size"]
+        download_object(get_url, store_at, size)
+        click.echo(f"Saved {size} bytes to {store_at}", err=True)
 
 
 # ======================================================================================
