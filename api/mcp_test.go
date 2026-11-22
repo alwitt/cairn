@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/alwitt/cairn/api"
+	"github.com/alwitt/cairn/artifact"
 	"github.com/alwitt/cairn/models"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -40,6 +41,7 @@ func mcpSampleArtifact(workspaceID string, name string, description *string) mod
 		MIMEType:    "application/octet-stream",
 		Size:        4096,
 		State:       models.ArtifactStateRecorded,
+		Revision:    3,
 		CreatedAt:   time.Date(2026, time.March, 14, 9, 26, 53, 0, time.UTC),
 		UpdatedAt:   time.Date(2026, time.May, 9, 17, 11, 2, 0, time.UTC),
 	}
@@ -157,6 +159,7 @@ func TestNewMCPListArtifactsResp(t *testing.T) {
 			assert.Equal(artifacts[idx].Name, entry.Name)
 			assert.Equal(artifacts[idx].Description, entry.Description)
 			assert.Equal(artifacts[idx].State, entry.State)
+			assert.Equal(artifacts[idx].Revision, entry.Revision)
 			assert.Equal(artifacts[idx].UpdatedAt, entry.UpdatedAt)
 		}
 
@@ -165,8 +168,8 @@ func TestNewMCPListArtifactsResp(t *testing.T) {
 		assert.Len(listing, 2)
 		first, ok := listing[0].(map[string]interface{})
 		assert.True(ok)
-		assert.Len(first, 4)
-		for _, field := range []string{"name", "description", "state", "updated_at"} {
+		assert.Len(first, 5)
+		for _, field := range []string{"name", "description", "state", "revision", "updated_at"} {
 			assert.Contains(first, field)
 		}
 		// Neither the entry ID nor the object key backing its content.
@@ -203,6 +206,65 @@ func TestNewMCPListArtifactsResp(t *testing.T) {
 			assert.Nil(err)
 			assert.JSONEq(`{"artifacts":[]}`, string(raw))
 		}
+	})
+}
+
+// TestNewMCPReadTextArtifactResp validates the read_text_artifact projection: the revision is
+// the one the content was read from, and line numbers are a prefix added on request only.
+func TestNewMCPReadTextArtifactResp(t *testing.T) {
+	read := artifact.TextArtifactContent{
+		Artifact:   mcpSampleArtifact(uuid.NewString(), "notes", nil),
+		Content:    "beta\ngamma\ndelta",
+		StartLine:  2,
+		TotalLines: 4,
+		LineEnding: models.TextLineEndingCRLF,
+	}
+
+	// Case 1: the content is passed through untouched, and the key set is exactly five, so
+	// nothing identifying the entry reaches the agent.
+	t.Run("projects the read as is", func(t *testing.T) {
+		assert := assert.New(t)
+
+		response := api.NewMCPReadTextArtifactResp(read, false)
+
+		assert.Equal(read.Content, response.Content)
+		assert.Equal(read.StartLine, response.StartLine)
+		assert.Equal(read.TotalLines, response.TotalLines)
+		assert.Equal(read.Artifact.Revision, response.Revision)
+		assert.Equal(models.TextLineEndingCRLF, response.LineEnding)
+
+		decoded := marshalToMap(t, response)
+		assert.Len(decoded, 5)
+		for _, field := range []string{
+			"content", "start_line", "total_lines", "revision", "line_ending",
+		} {
+			assert.Contains(decoded, field)
+		}
+	})
+
+	// Case 2: numbering starts at the first line read, not at 1, and reaches a last line that
+	// has no line ending.
+	t.Run("numbers lines from the start line", func(t *testing.T) {
+		assert := assert.New(t)
+
+		response := api.NewMCPReadTextArtifactResp(read, true)
+
+		assert.Equal("2\tbeta\n3\tgamma\n4\tdelta", response.Content)
+		assert.Equal(read.StartLine, response.StartLine)
+	})
+
+	// Case 3: a read past the end has no lines, so there is nothing to number.
+	t.Run("leaves empty content empty", func(t *testing.T) {
+		assert := assert.New(t)
+
+		empty := read
+		empty.Content = ""
+		assert.Equal("", api.NewMCPReadTextArtifactResp(empty, true).Content)
+
+		// a lone line ending is still one line
+		single := read
+		single.Content = "\n"
+		assert.Equal("2\t\n", api.NewMCPReadTextArtifactResp(single, true).Content)
 	})
 }
 

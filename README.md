@@ -329,6 +329,8 @@ artifact:
     putUrlTTLSecs: 360        # only has to outlive the transfer it was minted for
     getUrlMaxTTLSecs: 900     # ceiling on a download link; callers may ask for less
     maxObjectSize: 1073741824 # 1 GiB. Single PUT — multipart upload is out of scope.
+    maxTextSize: 1048576      # 1 MiB. Bounds every text tool; at most maxObjectSize.
+    textMaxAttempts: 3        # how often a text edit or read starts over when the artifact changes under it
     prefix:
       # base: <optional leading segment for every key>
       staging: staging        # in-flight uploads
@@ -444,6 +446,9 @@ relative to the configured `pathPrefix`.
 | `update_artifact` | Volume → object store, replacing an **existing** artifact's content |
 | `delete_artifact` | Delete an artifact |
 | `rename_artifact` | Change an artifact's name; content and description untouched |
+| `read_text_artifact` | Read lines of a plain text artifact straight into the result, with the revision they belong to |
+| `create_text_artifact` | Store text sent in the call as a **new** plain text artifact. The name must be free |
+| `edit_text_artifact` | Change part of a plain text artifact by exact-text replacement, guarded by its revision |
 
 ### How it differs from the REST API
 
@@ -457,6 +462,9 @@ relative to the configured `pathPrefix`.
 - **`download_artifact` will not create directories.** The destination's parent must already exist.
 - **Every call is synchronous.** cairn launches the sidecars and waits; the work is finished when
   the tool returns.
+- **Plain text can skip the volume.** The three text tools carry the content in the call itself:
+  no sidecar runs, and the volume need not be READY. An edit names the exact text to replace, never
+  a line number, and fails rather than overwrite a concurrent writer's change.
 
 ## Worked example
 

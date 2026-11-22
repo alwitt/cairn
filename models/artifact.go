@@ -56,6 +56,11 @@ type Artifact struct {
 	// State artifact state [RECORDED, MISSING_OBJECT]
 	State ArtifactStateENUM `json:"state" gorm:"column:state;not null;default:RECORDED" validate:"required,artifact_state" jsonschema:"artifact state. RECORDED: registered and stored, the normal live state. MISSING_OBJECT: the backing object is gone, a quarantine state preserving the metadata as evidence of the loss."`
 
+	// Revision content revision counter: 1 at create, +1 on every content change, never
+	// lowered. It moves only together with ObjectKey, in the same row update, which is what
+	// lets a guarded content update compare on it (see DESIGN §2.2, §7.5.2).
+	Revision int64 `json:"revision" gorm:"column:revision;not null;default:1" validate:"gte=1" jsonschema:"content revision of the artifact: 1 when created, and one higher after every content change"`
+
 	// CreatedAt entry creation timestamp
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt entry update timestamp

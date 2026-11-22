@@ -3,6 +3,7 @@ package artifact
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -25,6 +26,22 @@ type StagingUploadBundle struct {
 	StagingObjectKey string `json:"staging_object_key"`
 	// PutURL the PUR URL for uploading the artifact
 	PutURL string `json:"put_url"`
+}
+
+// TextArtifactContent a range of lines read from a plain text artifact
+type TextArtifactContent struct {
+	// Artifact the artifact entry the content was read from. Its revision is the one the
+	// content belongs to, so it is what a strict edit passes as its base revision.
+	Artifact models.Artifact
+	// Content the requested lines verbatim, with LF line endings. It is an exact substring of
+	// the artifact's LF content, so any part of it can be used as an edit's `old_text`.
+	Content string
+	// StartLine 1-based number of the first line in Content
+	StartLine int
+	// TotalLines number of lines in the whole artifact
+	TotalLines int
+	// LineEnding the line ending the artifact itself uses
+	LineEnding models.TextLineEndingENUM
 }
 
 // Manager artifact manager
@@ -134,8 +151,9 @@ type Manager interface {
 		§6.2, §6.3, §8.2.1).
 
 		Concurrent updates are last-writer-wins. Each writer copies to its own new key, and the
-		final entry update decides the winner; the loser's object is reclaimed the same way. There
-		is no optimistic locking (see DESIGN §7.5.2).
+		final entry update decides the winner; the loser's object is reclaimed the same way. The
+		entry update carries no expected revision, so it is unguarded, though it still raises the
+		entry's revision (see DESIGN §7.5.2).
 
 		An artifact quarantined as `MISSING_OBJECT` is a legitimate target: re-uploading its bytes
 		is exactly how it is brought back into service. The state transition is validated by the
@@ -156,6 +174,133 @@ type Manager interface {
 		artifact models.Artifact,
 		stagingObjKey string,
 		activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
+		StageTextBlob record a blob of plain text as a staging object within a workspace.
+
+		The text counterpart of `GetArtifactStagingPutURL`: the content arrives in the call
+		rather than through a presigned PUT, so the service writes the staging object itself
+		(see DESIGN §6.6). `CreateTextArtifact` pairs the returned staging object key with
+		`RegisterNewArtifact` to record a new text artifact.
+
+		The content is held to the rules every text tool applies, before anything is written:
+		  - it must fit under the text size cap;
+		  - it must be plain text - valid UTF-8, with no control character other than tab, LF,
+		    and CR as part of CRLF, and one line ending throughout (see DESIGN §7.6.1);
+		  - it must sniff as a text MIME type, so the text tools never create an artifact they
+		    would then refuse to read.
+
+		Purely an object-store operation - no DB entry is created here.
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - workspace this is for
+			@param content string - the full text to stage
+			@returns the staging object key
+	*/
+	StageTextBlob(ctx context.Context, workspace models.Workspace, content string) (string, error)
+
+	/*
+		CreateTextArtifact record a new plain text artifact from text sent in the call.
+
+		Three steps, the same ones the volume upload runs: the name is checked as free, the
+		text is staged with `StageTextBlob`, and the staging object is registered with
+		`RegisterNewArtifact` (see DESIGN §6.6, §7.6.5). The text is held to `StageTextBlob`'s
+		rules, and the new artifact starts at revision 1.
+
+		The name check is a fail-fast, so a taken name costs no staging write. The database's
+		uniqueness constraint remains the real guard for a caller that races another (see
+		DESIGN §7.5).
+
+		A failure after the text is staged leaves the staging object unreferenced. It is not
+		cleaned up here: the aged-staging sweep reclaims it (see DESIGN §8.2.1).
+
+		The parent workspace is taken as already resolved by the caller (see DESIGN §3).
+
+			@param ctx context.Context - execution context
+			@param workspace models.Workspace - workspace this is for
+			@param content string - the full text of the new artifact
+			@param name string - name a user will reference the artifact by
+			@param description *string - an optional description for the artifact
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it. Normally pass nil: a transaction handed in here is held open across
+			    the object store calls, and the only work inside it is the name check and the
+			    final insert.
+			@returns the new artifact entry
+	*/
+	CreateTextArtifact(
+		ctx context.Context,
+		workspace models.Workspace,
+		content string,
+		name string,
+		description *string,
+		activeSession db.Database,
+	) (models.Artifact, error)
+
+	/*
+		StageUpdatedArtifactText make one attempt at editing a plain text artifact, staging the
+		result.
+
+		The artifact entry is read fresh, its content fetched from the object store, and the
+		edits applied to it in order, all or nothing (see DESIGN §7.6.4). The edits are matched
+		against the content with LF line endings, whatever the artifact uses, and the result is
+		staged in the artifact's own line ending (see DESIGN §7.6.2) under `StageTextBlob`'s
+		rules.
+
+		Nothing is committed: the entry still points at its existing content. The entry returned
+		is the one the edits were applied to, and committing the staging object guarded on that
+		entry's revision is what makes the edit a compare-and-swap (see DESIGN §7.5.2).
+		`EditTextArtifact` does exactly that, starting over on a conflict.
+
+		A conflict can also surface here, before any commit: when the entry is not at the base
+		revision, or when it moved to a new object while its content was being read.
+
+			@param ctx context.Context - execution context
+			@param artifactID string - ID of the artifact to edit
+			@param edits []models.TextEdit - the edits to apply, in order
+			@param baseRevision *int64 - if set, refuse unless the artifact is still at this
+			    revision
+			@param activeSession db.Database - if set, this is an existing open DB persistence
+			    layer transaction, and function will perform additional persistence operations
+			    within it.
+			@returns the artifact entry the edits were applied to
+			@returns the staging object key holding the edited content
+	*/
+	StageUpdatedArtifactText(
+		ctx context.Context,
+		artifactID string,
+		edits []models.TextEdit,
+		baseRevision *int64,
+		activeSession db.Database,
+	) (models.Artifact, string, error)
+
+	/*
+		EditTextArtifact apply a list of exact-text replacements to a plain text artifact.
+
+		Each attempt stages the edit with `StageUpdatedArtifactText`, then commits it as a
+		compare-and-swap: the entry is repointed at the edited content only while it is still at
+		the revision the edits were applied to (see DESIGN §7.5.2).
+
+		Without a base revision, a conflict starts the attempt over against the newer content,
+		up to the configured number of attempts. The edits are re-applied, so a concurrent
+		change elsewhere in the artifact lets the edit through, while one to the text it targets
+		fails it with a legible error. With a base revision, a conflict is returned at once: the
+		revision only ever goes up, so a retry could never match it.
+
+		There is no `activeSession`. Each step runs in its own short transaction, since holding
+		one open across object store calls and retries is exactly the long transaction the
+		compare-and-swap exists to avoid.
+
+			@param ctx context.Context - execution context
+			@param artifactID string - ID of the artifact to edit
+			@param edits []models.TextEdit - the edits to apply, in order
+			@param baseRevision *int64 - if set, refuse unless the artifact is still at this
+			    revision
+			@returns the updated artifact entry
+	*/
+	EditTextArtifact(
+		ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64,
 	) (models.Artifact, error)
 
 	/*
@@ -233,6 +378,28 @@ type Manager interface {
 	GenerateGetURLForArtifact(
 		ctx context.Context, artifact models.Artifact, ttl time.Duration,
 	) (string, error)
+
+	/*
+		ReadTextArtifactContent read a range of lines from a plain text artifact.
+
+		Only a plain text artifact can be read: its MIME type must name a text format, checked
+		before anything is fetched, and its content must be plain text (see DESIGN §7.6.1). The
+		lines are returned with LF line endings, whatever the artifact uses, and the artifact's
+		own line ending is reported alongside (see DESIGN §7.6.2).
+
+		The content returned always belongs to the revision of the entry returned with it. If
+		the artifact moves to a new object while its content is being read, the read starts over
+		against the newer entry, up to the configured number of attempts.
+
+			@param ctx context.Context - execution context
+			@param artifact models.Artifact - the artifact to read
+			@param offset int - 1-based number of the first line to return
+			@param limit *int - if set, the most lines to return; otherwise every line from offset
+			@returns the selected lines and the entry they were read from
+	*/
+	ReadTextArtifactContent(
+		ctx context.Context, artifact models.Artifact, offset int, limit *int,
+	) (TextArtifactContent, error)
 
 	/*
 		RenameArtifact change an artifact's name.
@@ -477,6 +644,146 @@ func (m *managerImpl) enforceSizeCap(size int64, subject string) error {
 		)
 	}
 	return nil
+}
+
+// enforceTextSizeCap reject text larger than the text size cap.
+//
+// The text tools hold a whole file in memory and carry it inside the MCP request, so they work
+// under a cap far below the single-PUT one (see DESIGN §6.6). Every text read, edit, and stage
+// routes through here.
+func (m *managerImpl) enforceTextSizeCap(size int64, subject string) error {
+	if size > m.storeConfig.MaxTextSizeBytes {
+		return goutils.NewBadInputError(
+			fmt.Sprintf(
+				"%s is %d bytes, over the %d byte text size cap",
+				subject, size, m.storeConfig.MaxTextSizeBytes,
+			), nil, true,
+		)
+	}
+	return nil
+}
+
+// isRevisionConflict whether a failure is a revision conflict, which a text read or edit may
+// start over on.
+func isRevisionConflict(err error) bool {
+	var conflict models.ArtifactRevisionConflictError
+	return errors.As(err, &conflict)
+}
+
+/*
+readTextObject fetch a plain text artifact's content from the object store.
+
+The checks that need no content come first - the entry must be `RECORDED`, carry a text MIME
+type, and fit under the text size cap - so refusing a non-text or oversized artifact costs
+nothing.
+
+A failed fetch is not taken at face value. The reaper ages an object by when it was written,
+not by when it lost its entry, so an update that lands while this read is in flight can
+orphan the very object being read, and the next sweep may delete it (see DESIGN §8.2.1). The
+entry is read again to tell that apart: if it now points at a different object, the failure
+is reported as a revision conflict, which a caller can start over on. Otherwise the fetch
+failure stands.
+
+	@param ctx context.Context - execution context
+	@param entry models.Artifact - the artifact entry whose content to fetch
+	@param activeSession db.Database - if set, this is an existing open DB persistence
+	    layer transaction, and function will perform additional persistence operations
+	    within it.
+	@returns the content, not yet checked for being plain text
+*/
+func (m *managerImpl) readTextObject(
+	ctx context.Context, entry models.Artifact, activeSession db.Database,
+) ([]byte, error) {
+	if entry.State != models.ArtifactStateRecorded {
+		return nil, goutils.NewConsistencyError(
+			fmt.Sprintf(
+				"artifact %s is '%s'; only a '%s' artifact has content to read",
+				entry.ID, entry.State, models.ArtifactStateRecorded,
+			), nil, true,
+		)
+	}
+
+	if !isTextMIMEType(entry.MIMEType) {
+		return nil, goutils.NewBadInputError(
+			fmt.Sprintf(
+				"artifact %s is '%s', not a plain text artifact", entry.ID, entry.MIMEType,
+			), nil, true,
+		)
+	}
+
+	subject := fmt.Sprintf("artifact %s", entry.ID)
+	if err := m.enforceTextSizeCap(entry.Size, subject); err != nil {
+		return nil, err
+	}
+
+	content, fetchErr := m.fetchObjectContent(ctx, entry.ObjectKey, m.storeConfig.MaxTextSizeBytes)
+	if fetchErr == nil {
+		// The entry's size was checked above, but what arrived is what is held in memory.
+		if err := m.enforceTextSizeCap(int64(len(content)), subject); err != nil {
+			return nil, err
+		}
+		return content, nil
+	}
+
+	current, err := m.readArtifactEntry(ctx, entry.ID, activeSession)
+	if err != nil {
+		return nil, err
+	}
+	if current.ObjectKey != entry.ObjectKey {
+		return nil, models.NewArtifactRevisionConflictError(
+			fmt.Sprintf(
+				"artifact %s moved from revision %d to %d while its content was being read",
+				entry.ID, entry.Revision, current.Revision,
+			),
+			goutils.NewConsistencyError(
+				fmt.Sprintf("artifact %s content changed during the read", entry.ID), fetchErr, false,
+			),
+			true,
+		)
+	}
+	return nil, fetchErr
+}
+
+/*
+fetchObjectContent read an object's content into memory, up to a limit.
+
+At most `limit + 1` bytes are read, so a caller comparing the length against `limit` can tell
+an object that fits from one that does not, without holding more than one byte past the cap.
+
+	@param ctx context.Context - execution context
+	@param objectKey string - the object to read
+	@param limit int64 - the most bytes the caller is prepared to hold
+	@returns the content read
+*/
+func (m *managerImpl) fetchObjectContent(
+	ctx context.Context, objectKey string, limit int64,
+) ([]byte, error) {
+	s3Client, err := m.s3Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	_, reader, err := s3Client.GetObject(ctx, m.storeConfig.Bucket, objectKey)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := reader.Close(); err != nil {
+			log.
+				WithError(err).
+				WithFields(m.GetLogTagsForContext(ctx)).
+				WithField("object_key", objectKey).
+				Warn("Failed to close object reader after reading its content")
+		}
+	}()
+
+	content, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, goutils.NewObjectStoreError(
+			fmt.Sprintf("failed to read s3://%s/%s", m.storeConfig.Bucket, objectKey), err, true,
+		)
+	}
+	return content, nil
 }
 
 // s3Client acquire the object store client to use for a single call.

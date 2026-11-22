@@ -236,6 +236,9 @@ type SystemEventRenameArtifact struct {
 // Both the outgoing and incoming object are captured: the update writes a NEW key and flips
 // the row over to it, leaving the old object orphaned for the object-reaping GC. The old key
 // recorded here is the audit trail's only record of what that orphan was.
+//
+// The revisions are optional: zero means "not recorded", which keeps events written before the
+// artifact carried a revision parseable.
 type SystemEventUpdateArtifactObject struct {
 	// WorkspaceID ID of the parent workspace
 	WorkspaceID string `json:"workspace_id" validate:"required,uuid"`
@@ -255,6 +258,10 @@ type SystemEventUpdateArtifactObject struct {
 	NewMIMEType string `json:"new_mime_type" validate:"required"`
 	// NewSize size in bytes of the backing object after the update
 	NewSize int64 `json:"new_size" validate:"gte=0"`
+	// OldRevision the artifact's content revision prior to the update; 0 when not recorded
+	OldRevision int64 `json:"old_revision,omitempty" validate:"gte=0"`
+	// NewRevision the artifact's content revision after the update; 0 when not recorded
+	NewRevision int64 `json:"new_revision,omitempty" validate:"gte=0"`
 }
 
 // SystemEventArtifactMissingObject records an artifact quarantined because its backing object

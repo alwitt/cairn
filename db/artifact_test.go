@@ -80,6 +80,8 @@ func TestArtifactDefineNewArtifact(t *testing.T) {
 	// the object is already in place at its final key, so the entry is committed directly as
 	// RECORDED - there is no pending state (DESIGN §6.1)
 	assert.Equal(models.ArtifactStateRecorded, artifact0.State)
+	// a new entry starts at the first content revision (DESIGN §2.2)
+	assert.Equal(int64(1), artifact0.Revision)
 
 	// Case 1: the entry persisted and reads back identically
 	assert.Nil(persistence.UseDatabaseInTransaction(
@@ -89,6 +91,7 @@ func TestArtifactDefineNewArtifact(t *testing.T) {
 				return err
 			}
 			assert.Equal(artifact0.ID, readBack.ID)
+			assert.Equal(int64(1), readBack.Revision)
 			assert.Equal(artifact0.WorkspaceID, readBack.WorkspaceID)
 			assert.Equal(artifact0.Name, readBack.Name)
 			assert.Equal(artifact0.ObjectKey, readBack.ObjectKey)
@@ -488,6 +491,8 @@ func TestArtifactUpdateName(t *testing.T) {
 			// touches the object store (DESIGN §2.2)
 			assert.Equal(artifact0.ObjectKey, readBack.ObjectKey)
 			assert.Equal(models.ArtifactStateRecorded, readBack.State)
+			// a rename is not a content change, so the revision is untouched (DESIGN §7.5.2)
+			assert.Equal(artifact0.Revision, readBack.Revision)
 			return nil
 		},
 	))
@@ -632,6 +637,9 @@ func TestArtifactUpdateDescription(t *testing.T) {
 			assert.Equal(artifact0.ObjectKey, artifact.ObjectKey)
 			assert.Equal(artifact0.Size, artifact.Size)
 			assert.Equal(models.ArtifactStateRecorded, artifact.State)
+			// a description change is not a content change, so the revision is untouched
+			// (DESIGN §7.5.2)
+			assert.Equal(artifact0.Revision, artifact.Revision)
 			return nil
 		},
 	))
@@ -732,7 +740,7 @@ func TestArtifactUpdateObject(t *testing.T) {
 	assert.Nil(persistence.UseDatabaseInTransaction(
 		utCtx, func(ctx context.Context, dbClient db.Database) error {
 			return dbClient.UpdateArtifactObject(
-				ctx, artifact0.ID, secondKey, "application/json", 250,
+				ctx, artifact0.ID, secondKey, "application/json", 250, nil,
 			)
 		},
 	))
@@ -744,6 +752,8 @@ func TestArtifactUpdateObject(t *testing.T) {
 		assert.Equal("application/json", readBack.MIMEType)
 		assert.Equal(int64(250), readBack.Size)
 		assert.Equal(models.ArtifactStateRecorded, readBack.State)
+		// every content change raises the revision by one (DESIGN §7.5.2)
+		assert.Equal(int64(2), readBack.Revision)
 		// the update repoints the object only - the identity of the artifact is unchanged
 		assert.Equal(artifact0.ID, readBack.ID)
 		assert.Equal(artifact0.Name, readBack.Name)
@@ -768,6 +778,8 @@ func TestArtifactUpdateObject(t *testing.T) {
 		assert.Equal(secondKey, meta.NewObjectKey)
 		assert.Equal("application/json", meta.NewMIMEType)
 		assert.Equal(int64(250), meta.NewSize)
+		assert.Equal(int64(1), meta.OldRevision)
+		assert.Equal(int64(2), meta.NewRevision)
 	}
 
 	// Case 2: a second update chains off the first - the old values are now the previous
@@ -776,7 +788,7 @@ func TestArtifactUpdateObject(t *testing.T) {
 	assert.Nil(persistence.UseDatabaseInTransaction(
 		utCtx, func(ctx context.Context, dbClient db.Database) error {
 			return dbClient.UpdateArtifactObject(
-				ctx, artifact0.ID, thirdKey, "text/csv", 0,
+				ctx, artifact0.ID, thirdKey, "text/csv", 0, nil,
 			)
 		},
 	))
@@ -794,6 +806,8 @@ func TestArtifactUpdateObject(t *testing.T) {
 		assert.Equal(thirdKey, meta.NewObjectKey)
 		assert.Equal("text/csv", meta.NewMIMEType)
 		assert.Equal(int64(0), meta.NewSize)
+		assert.Equal(int64(2), meta.OldRevision)
+		assert.Equal(int64(3), meta.NewRevision)
 	}
 
 	// Case 3: an update restores a quarantined artifact to RECORDED, so re-uploading the bytes
@@ -803,13 +817,18 @@ func TestArtifactUpdateObject(t *testing.T) {
 			return dbClient.MarkArtifactMissingObject(ctx, artifact0.ID)
 		},
 	))
-	assert.Equal(models.ArtifactStateMissingObject, readArtifact().State)
+	{
+		readBack := readArtifact()
+		assert.Equal(models.ArtifactStateMissingObject, readBack.State)
+		// quarantine changes the state only, never the content revision
+		assert.Equal(int64(3), readBack.Revision)
+	}
 
 	recoveryKey := unitTestObjectKey(workspace.ID)
 	assert.Nil(persistence.UseDatabaseInTransaction(
 		utCtx, func(ctx context.Context, dbClient db.Database) error {
 			return dbClient.UpdateArtifactObject(
-				ctx, artifact0.ID, recoveryKey, "text/plain", 42,
+				ctx, artifact0.ID, recoveryKey, "text/plain", 42, nil,
 			)
 		},
 	))
@@ -818,6 +837,9 @@ func TestArtifactUpdateObject(t *testing.T) {
 		assert.Equal(models.ArtifactStateRecorded, readBack.State)
 		assert.Equal(recoveryKey, readBack.ObjectKey)
 		assert.Equal(int64(42), readBack.Size)
+		// the restore is a content change like any other: the revision goes up and is never
+		// reset (DESIGN §7.5.2)
+		assert.Equal(int64(4), readBack.Revision)
 		assert.Len(updateEvents(), 3)
 	}
 
@@ -840,7 +862,7 @@ func TestArtifactUpdateObject(t *testing.T) {
 			err := persistence.UseDatabaseInTransaction(
 				utCtx, func(ctx context.Context, dbClient db.Database) error {
 					return dbClient.UpdateArtifactObject(
-						ctx, artifact0.ID, update.objectKey, update.mimeType, update.size,
+						ctx, artifact0.ID, update.objectKey, update.mimeType, update.size, nil,
 					)
 				},
 			)
@@ -857,6 +879,7 @@ func TestArtifactUpdateObject(t *testing.T) {
 		assert.Equal(recoveryKey, readBack.ObjectKey)
 		assert.Equal("text/plain", readBack.MIMEType)
 		assert.Equal(int64(42), readBack.Size)
+		assert.Equal(int64(4), readBack.Revision)
 	}
 
 	// Case 5: updating an unknown artifact surfaces a NotFoundError and records nothing
@@ -864,13 +887,191 @@ func TestArtifactUpdateObject(t *testing.T) {
 		err := persistence.UseDatabaseInTransaction(
 			utCtx, func(ctx context.Context, dbClient db.Database) error {
 				return dbClient.UpdateArtifactObject(
-					ctx, ulid.Make().String(), unitTestObjectKey(workspace.ID), "text/plain", 1,
+					ctx, ulid.Make().String(), unitTestObjectKey(workspace.ID), "text/plain", 1, nil,
 				)
 			},
 		)
 		assert.NotNil(err)
 		var notFound goutils.NotFoundError
 		assert.True(errors.As(err, &notFound), "expected NotFoundError, got %T", err)
+		assert.Len(updateEvents(), 3)
+	}
+}
+
+func TestArtifactUpdateObjectExpectedRevision(t *testing.T) {
+	assert := assert.New(t)
+	log.SetLevel(log.DebugLevel)
+
+	utCtx := context.Background()
+	testDB := fmt.Sprintf("/tmp/cairn_ut_%s.db", ulid.Make().String())
+	log.WithField("db", testDB).Debug("Test database")
+
+	persistence := getUnitTestPersistence(utCtx, t, testDB)
+	validate := getUnitTestValidator(t)
+
+	workspace := defineUnitTestWorkspace(utCtx, t, persistence, "unit-test-guarded-update-parent")
+
+	var artifact0 models.Artifact
+	assert.Nil(persistence.UseDatabaseInTransaction(
+		utCtx, func(ctx context.Context, dbClient db.Database) error {
+			var err error
+			artifact0, err = dbClient.DefineNewArtifact(ctx, db.NewArtifactParameter{
+				WorkspaceID: workspace.ID,
+				Name:        "unit-test-guarded-update-artifact",
+				ObjectKey:   unitTestObjectKey(workspace.ID),
+				MIMEType:    "text/plain",
+				Size:        100,
+			})
+			return err
+		},
+	))
+	assert.Equal(int64(1), artifact0.Revision)
+
+	// helper: point the artifact at a new object, optionally guarded by an expected revision
+	updateObject := func(objectKey string, size int64, expectedRevision *int64) error {
+		return persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateArtifactObject(
+					ctx, artifact0.ID, objectKey, "text/plain", size, expectedRevision,
+				)
+			},
+		)
+	}
+
+	// helper: read the artifact back
+	readArtifact := func() models.Artifact {
+		var artifact models.Artifact
+		assert.Nil(persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				var err error
+				artifact, err = dbClient.GetArtifact(ctx, artifact0.ID)
+				return err
+			},
+		))
+		return artifact
+	}
+
+	// helper: list the recorded object update events
+	updateEvents := func() []models.SystemEventAudit {
+		var events []models.SystemEventAudit
+		assert.Nil(persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				var err error
+				events, err = dbClient.ListSystemEvents(ctx, db.SystemEventQueryFilter{
+					EventTypes: []models.SystemEventTypeENUM{
+						models.SystemEventTypeUpdateArtifactObject,
+					},
+				})
+				return err
+			},
+		))
+		return events
+	}
+
+	revision := func(value int64) *int64 { return &value }
+
+	// Case 0: an update guarded by the current revision lands and raises it by one
+	secondKey := unitTestObjectKey(workspace.ID)
+	assert.Nil(updateObject(secondKey, 200, revision(1)))
+	{
+		readBack := readArtifact()
+		assert.Equal(secondKey, readBack.ObjectKey)
+		assert.Equal(int64(200), readBack.Size)
+		assert.Equal(int64(2), readBack.Revision)
+
+		events := updateEvents()
+		assert.Len(events, 1)
+		parsed, err := events[0].ParseMetadata(validate)
+		assert.Nil(err)
+		meta, ok := parsed.(models.SystemEventUpdateArtifactObject)
+		assert.True(ok, "expected SystemEventUpdateArtifactObject, got %T", parsed)
+		assert.Equal(int64(1), meta.OldRevision)
+		assert.Equal(int64(2), meta.NewRevision)
+	}
+
+	// Case 1: an update guarded by a revision the entry has moved past is refused by the
+	// update's own WHERE clause. The refusal is a conflict, distinct from every other failed
+	// precondition, and leaves both the entry and the audit trail untouched.
+	{
+		err := updateObject(unitTestObjectKey(workspace.ID), 300, revision(1))
+		assert.NotNil(err)
+		var conflict models.ArtifactRevisionConflictError
+		assert.True(
+			errors.As(err, &conflict), "expected ArtifactRevisionConflictError, got %T", err,
+		)
+		// generic handling still sees a precondition the caller can act on
+		var consistency goutils.ConsistencyError
+		assert.True(errors.As(err, &consistency), "expected ConsistencyError, got %T", err)
+
+		readBack := readArtifact()
+		assert.Equal(secondKey, readBack.ObjectKey)
+		assert.Equal("text/plain", readBack.MIMEType)
+		assert.Equal(int64(200), readBack.Size)
+		assert.Equal(int64(2), readBack.Revision)
+		assert.Len(updateEvents(), 1)
+	}
+
+	// Case 2: unguarded updates are last-writer-wins. Both land, and each raises the revision.
+	thirdKey := unitTestObjectKey(workspace.ID)
+	fourthKey := unitTestObjectKey(workspace.ID)
+	assert.Nil(updateObject(thirdKey, 300, nil))
+	assert.Nil(updateObject(fourthKey, 400, nil))
+	{
+		readBack := readArtifact()
+		assert.Equal(fourthKey, readBack.ObjectKey)
+		assert.Equal(int64(400), readBack.Size)
+		assert.Equal(int64(4), readBack.Revision)
+		assert.Len(updateEvents(), 3)
+	}
+
+	// Case 3: because an unguarded update still raises the revision, a guarded writer whose
+	// read predates it is refused rather than silently overwriting the newer content
+	{
+		err := updateObject(unitTestObjectKey(workspace.ID), 500, revision(2))
+		assert.NotNil(err)
+		var conflict models.ArtifactRevisionConflictError
+		assert.True(
+			errors.As(err, &conflict), "expected ArtifactRevisionConflictError, got %T", err,
+		)
+		readBack := readArtifact()
+		assert.Equal(fourthKey, readBack.ObjectKey)
+		assert.Equal(int64(4), readBack.Revision)
+		assert.Len(updateEvents(), 3)
+	}
+
+	// Case 4: an expected revision below 1 names no revision at all, and is rejected before
+	// the update
+	for _, bad := range []int64{0, -1} {
+		err := updateObject(unitTestObjectKey(workspace.ID), 1, revision(bad))
+		assert.NotNil(err, "expected revision %d should be rejected", bad)
+		var validationError goutils.ValidationError
+		assert.True(
+			errors.As(err, &validationError),
+			"expected revision %d: expected ValidationError, got %T", bad, err,
+		)
+	}
+	assert.Equal(int64(4), readArtifact().Revision)
+	assert.Len(updateEvents(), 3)
+
+	// Case 5: a guarded update of an unknown artifact surfaces a NotFoundError, not a conflict
+	{
+		err := persistence.UseDatabaseInTransaction(
+			utCtx, func(ctx context.Context, dbClient db.Database) error {
+				return dbClient.UpdateArtifactObject(
+					ctx,
+					ulid.Make().String(),
+					unitTestObjectKey(workspace.ID),
+					"text/plain",
+					1,
+					revision(1),
+				)
+			},
+		)
+		assert.NotNil(err)
+		var notFound goutils.NotFoundError
+		assert.True(errors.As(err, &notFound), "expected NotFoundError, got %T", err)
+		var conflict models.ArtifactRevisionConflictError
+		assert.False(errors.As(err, &conflict), "an unknown artifact is not a conflict")
 		assert.Len(updateEvents(), 3)
 	}
 }

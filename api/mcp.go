@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/alwitt/cairn/artifact"
@@ -225,12 +226,77 @@ type MCPRenameArtifactParams struct {
 }
 
 // ======================================================================================
+// Text artifact tool call parameters
+//
+// The inline text tools: the content travels in the call itself, so none of them names a
+// volume path or touches the volume (see DESIGN §6.6, §7.6).
+
+// MCPReadTextArtifactParams parameters for the read_text_artifact tool.
+type MCPReadTextArtifactParams struct {
+	// WorkspaceName name of the workspace holding the artifact
+	WorkspaceName string `json:"workspace_name" validate:"required,valid_name" jsonschema:"name of the workspace holding the artifact; can only contain alphanumeric characters, - and _"`
+
+	// ArtifactName name of the plain text artifact to read
+	ArtifactName string `json:"artifact_name" validate:"required,valid_name" jsonschema:"name of the plain text artifact to read; can only contain alphanumeric characters, - and _"`
+
+	// Offset 1-based number of the first line to return
+	Offset *int `json:"offset,omitempty" validate:"omitempty,gte=1" jsonschema:"number of the first line to return, counting from 1; must be >= 1. Omit to start at line 1."`
+
+	// Limit max number of lines to return
+	Limit *int `json:"limit,omitempty" validate:"omitempty,gte=1" jsonschema:"max number of lines to return; must be >= 1. Omit to return every line from offset to the end."`
+
+	// LineNumbers prefix each returned line with its line number
+	LineNumbers bool `json:"line_numbers,omitempty" jsonschema:"prefix each returned line with its line number and one tab; default false. The prefix is not part of the artifact: leave the number and the tab out of any text you copy into an edit's old_text."`
+}
+
+// MCPCreateTextArtifactParams parameters for the create_text_artifact tool.
+//
+// `Content` carries no `required` rule: an empty file is a legitimate artifact. The schema still
+// requires the key, so an agent cannot leave it out by accident.
+type MCPCreateTextArtifactParams struct {
+	// WorkspaceName name of the workspace to record the new artifact in
+	WorkspaceName string `json:"workspace_name" validate:"required,valid_name" jsonschema:"name of the workspace to record the new artifact in; can only contain alphanumeric characters, - and _"`
+
+	// ArtifactName name to give the new artifact
+	ArtifactName string `json:"artifact_name" validate:"required,valid_name" jsonschema:"name to give the new artifact; can only contain alphanumeric characters, - and _, and must not already be taken by another artifact in this workspace"`
+
+	// Content the full text of the new artifact
+	Content string `json:"content" jsonschema:"the full text of the new artifact, stored exactly as given. It must be plain text: valid UTF-8, with no control characters other than tab and line breaks, and one line ending (LF or CRLF) throughout."`
+
+	// Description an optional description for the new artifact
+	Description *string `json:"description,omitempty" validate:"omitempty" jsonschema:"an optional description for the new artifact"`
+}
+
+// MCPEditTextArtifactParams parameters for the edit_text_artifact tool.
+//
+// Each edit's own rules - non-empty, different from its replacement, found exactly once - are
+// left to the manager, whose errors name the edit that failed (see DESIGN §7.6.4).
+type MCPEditTextArtifactParams struct {
+	// WorkspaceName name of the workspace holding the artifact
+	WorkspaceName string `json:"workspace_name" validate:"required,valid_name" jsonschema:"name of the workspace holding the artifact; can only contain alphanumeric characters, - and _"`
+
+	// ArtifactName name of the plain text artifact to edit
+	ArtifactName string `json:"artifact_name" validate:"required,valid_name" jsonschema:"name of the plain text artifact to edit; can only contain alphanumeric characters, - and _"`
+
+	// Edits the replacements to make, in order
+	Edits []models.TextEdit `json:"edits" validate:"required,min=1" jsonschema:"the replacements to make, at least one. They apply in order, each to the text the one before it left. All or nothing: if any edit fails, nothing is written."`
+
+	// BaseRevision if set, refuse unless the artifact is still at this revision
+	BaseRevision *int64 `json:"base_revision,omitempty" validate:"omitempty,gte=1" jsonschema:"optional strict mode: refuse the edit unless the artifact is still at this revision, the one read_text_artifact reported; must be >= 1. Omit it and a change elsewhere in the artifact since your read lets the edit through, as long as every old_text still matches."`
+}
+
+// ======================================================================================
 // MCP tool call responses
 //
-// Only the read tools carry one. The action tools return a plain text confirmation and
-// signal failure through their handler's error return, which the SDK surfaces as
-// `CallToolResult.IsError` - MCP already carries the success/error signal and the request
-// correlation at the protocol level, so there is nothing for a structured result to add.
+// The read tools carry one, and so do the two text write tools: their result is the new
+// revision, a value an agent passes back as a later edit's `base_revision`, so it is given as
+// a field alongside the text confirmation. The confirmation is repeated in a `message` field,
+// since some clients show an agent only the structured result when there is one.
+//
+// The other action tools return only a plain text confirmation and signal failure through
+// their handler's error return, which the SDK surfaces as `CallToolResult.IsError` - MCP
+// already carries the success/error signal and the request correlation at the protocol level,
+// so there is nothing for a structured result to add.
 //
 // These are deliberately NARROW projections of the `models` types rather than the types
 // themselves. An agent's whole job here is to pick a workspace and find an artifact by name;
@@ -334,6 +400,9 @@ type MCPArtifactListEntry struct {
 	// State of the artifact
 	State models.ArtifactStateENUM `json:"state" jsonschema:"state of the artifact. RECORDED: the artifact is registered and its content is stored, the normal usable state. MISSING_OBJECT: the artifact's stored content is gone and only its metadata remains, a quarantine state - such an artifact cannot be downloaded, though replacing its content restores it."`
 
+	// Revision content revision of the artifact
+	Revision int64 `json:"revision" jsonschema:"content revision of the artifact: 1 when created, and one higher after every content change. A strict edit passes it to edit_text_artifact as base_revision."`
+
 	// UpdatedAt when the artifact was last modified
 	UpdatedAt time.Time `json:"updated_at" jsonschema:"when the artifact was last modified, whether its content, name, or description"`
 }
@@ -360,10 +429,100 @@ func NewMCPListArtifactsResp(artifacts []models.Artifact) MCPListArtifactsResp {
 			Name:        artifact.Name,
 			Description: artifact.Description,
 			State:       artifact.State,
+			Revision:    artifact.Revision,
 			UpdatedAt:   artifact.UpdatedAt,
 		}
 	}
 	return MCPListArtifactsResp{Artifacts: entries}
+}
+
+// ======================================================================================
+// Text artifact tool call responses
+
+// MCPReadTextArtifactResp response for the read_text_artifact tool.
+type MCPReadTextArtifactResp struct {
+	// Content the requested lines
+	Content string `json:"content" jsonschema:"the requested lines, with LF line endings. Without line_numbers this is the artifact's exact text, so any part of it can be copied into an edit's old_text as is."`
+
+	// StartLine number of the first line in Content
+	StartLine int `json:"start_line" jsonschema:"number of the first line in content, counting from 1"`
+
+	// TotalLines number of lines in the whole artifact
+	TotalLines int `json:"total_lines" jsonschema:"number of lines in the whole artifact, so you can tell whether there is more to read"`
+
+	// Revision the content revision the lines belong to
+	Revision int64 `json:"revision" jsonschema:"content revision these lines belong to. Pass it to edit_text_artifact as base_revision to make an edit fail if anything changed since this read."`
+
+	// LineEnding the line ending the artifact itself uses
+	LineEnding models.TextLineEndingENUM `json:"line_ending" jsonschema:"the line ending the artifact itself uses. LF: every line ends with LF. CRLF: every line ends with CR LF. Either way content comes back with LF, edits are matched against LF, and an edit keeps the artifact's own line ending."`
+}
+
+/*
+NewMCPReadTextArtifactResp project the lines read from a text artifact onto the
+read_text_artifact tool response.
+
+The revision is taken from the entry the content was read from, which is the revision the
+content belongs to even when the read had to start over against a newer one.
+
+	@param read artifact.TextArtifactContent - what was read
+	@param lineNumbers bool - whether to prefix each line with its line number
+	@returns the tool response
+*/
+func NewMCPReadTextArtifactResp(
+	read artifact.TextArtifactContent, lineNumbers bool,
+) MCPReadTextArtifactResp {
+	content := read.Content
+	if lineNumbers {
+		content = numberLines(content, read.StartLine)
+	}
+	return MCPReadTextArtifactResp{
+		Content:    content,
+		StartLine:  read.StartLine,
+		TotalLines: read.TotalLines,
+		Revision:   read.Artifact.Revision,
+		LineEnding: read.LineEnding,
+	}
+}
+
+/*
+numberLines prefix each line with its line number and one tab.
+
+No padding: the tab is the separator, which is all an agent needs to strip the prefix (see
+DESIGN §7.6.3). A last line with no line ending is still numbered, and empty content stays
+empty.
+
+	@param content string - LF text, one or more whole lines
+	@param startLine int - the number of the first line
+	@returns the numbered text
+*/
+func numberLines(content string, startLine int) string {
+	var builder strings.Builder
+	for idx, line := range strings.SplitAfter(content, "\n") {
+		// The split leaves an empty element after a final line ending; it is not a line.
+		if line == "" {
+			continue
+		}
+		fmt.Fprintf(&builder, "%d\t%s", startLine+idx, line)
+	}
+	return builder.String()
+}
+
+// MCPCreateTextArtifactResp response for the create_text_artifact tool.
+type MCPCreateTextArtifactResp struct {
+	// Message the confirmation also carried as the tool's text result
+	Message string `json:"message" jsonschema:"the same confirmation as the tool's text result, repeated here for clients that show only this structured result"`
+
+	// Revision the new artifact's content revision
+	Revision int64 `json:"revision" jsonschema:"content revision of the new artifact, which is always 1"`
+}
+
+// MCPEditTextArtifactResp response for the edit_text_artifact tool.
+type MCPEditTextArtifactResp struct {
+	// Message the confirmation also carried as the tool's text result
+	Message string `json:"message" jsonschema:"the same confirmation as the tool's text result, repeated here for clients that show only this structured result"`
+
+	// Revision the artifact's content revision after the edit
+	Revision int64 `json:"revision" jsonschema:"content revision of the artifact after the edit. Pass it as base_revision to make a follow-up edit fail if anything changes in between."`
 }
 
 // ======================================================================================
@@ -414,9 +573,16 @@ and outlive it. So the usual shape of a workflow is: a tool writes a file into t
 upload_artifact it to make it durable, and a later step - possibly against a different volume -
 download_artifact's it back.
 
+Plain text artifacts can also be worked on inside the tool call itself: read_text_artifact
+returns their lines, create_text_artifact stores text you send as a new artifact, and
+edit_text_artifact changes part of one by exact-text replacement, the way you edit a file.
+These three never touch the volume, so they work whatever its state. A copy of an artifact
+already downloaded into the volume is a separate file and does not change when the artifact
+does; download it again to see the new content.
+
 You cannot create a workspace or provision its volume; an operator does that. Use get_workspace
-or list_workspaces to find one and check that its volume state is READY, which every transfer
-requires.
+or list_workspaces to find one and check that its volume state is READY, which every tool that
+moves a file between the volume and an artifact requires.
 
 Workspaces and artifacts are addressed by name, never by ID. An artifact's name is unique within
 its workspace.`
@@ -499,6 +665,7 @@ func NewMCPHandler(
 	// in lock-step with the const blocks in the models package.
 	goutils.MCPInstallEnumSchema[models.ArtifactStateENUM](&handler.MCPHandler)
 	goutils.MCPInstallEnumSchema[models.SystemEventTypeENUM](&handler.MCPHandler)
+	goutils.MCPInstallEnumSchema[models.TextLineEndingENUM](&handler.MCPHandler)
 	goutils.MCPInstallEnumSchema[models.WorkspaceVolumeStateENUM](&handler.MCPHandler)
 	goutils.MCPInstallEnumSchema[models.WorkspaceVolumeTypeENUM](&handler.MCPHandler)
 
@@ -523,6 +690,10 @@ func (h MCPHandler) RegisterTools(server *mcp.Server) error {
 		h.registerUpdateArtifactTool,
 		h.registerDeleteArtifactTool,
 		h.registerRenameArtifactTool,
+		// Text artifact tools
+		h.registerReadTextArtifactTool,
+		h.registerCreateTextArtifactTool,
+		h.registerEditTextArtifactTool,
 	}
 	for _, register := range registrations {
 		if err := register(server); err != nil {

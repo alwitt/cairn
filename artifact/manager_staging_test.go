@@ -43,6 +43,11 @@ const (
 	unitTestGetURLMaxTTLSec = 600
 	// unitTestMaxObjectSize the single-PUT size cap the harness manager is configured with
 	unitTestMaxObjectSize int64 = 4096
+	// unitTestMaxTextSize the text size cap the harness manager is configured with
+	unitTestMaxTextSize int64 = 1024
+	// unitTestTextMaxAttempts the text read / edit attempt limit the harness manager is
+	// configured with
+	unitTestTextMaxAttempts = 3
 )
 
 // unitTestStoreConfig build the storage config the harness manager is constructed with.
@@ -52,6 +57,8 @@ func unitTestStoreConfig() models.ArtifactStorageConfig {
 		UploadPutURLTTLSecs:      unitTestPutURLTTLSec,
 		DownloadGetURLMaxTTLSecs: unitTestGetURLMaxTTLSec,
 		MaxObjectSizeBytes:       unitTestMaxObjectSize,
+		MaxTextSizeBytes:         unitTestMaxTextSize,
+		TextMaxAttempts:          unitTestTextMaxAttempts,
 		Prefix: models.ArtifactKeyConfig{
 			StagingPrefix: unitTestStagingPrefix,
 			StorePrefix:   unitTestStorePrefix,
@@ -1113,17 +1120,26 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		expected.Size = int64(len(fixture.content))
 
 		var (
-			gotID       string
-			gotKey      string
-			gotMIMEType string
-			gotSize     int64
+			gotID               string
+			gotKey              string
+			gotMIMEType         string
+			gotSize             int64
+			gotExpectedRevision *int64
 		)
 		fixture.mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
-			Run(func(_ context.Context, id string, key string, mimeType string, size int64) {
+			Run(func(
+				_ context.Context,
+				id string,
+				key string,
+				mimeType string,
+				size int64,
+				expectedRevision *int64,
+			) {
 				gotID, gotKey, gotMIMEType, gotSize = id, key, mimeType, size
+				gotExpectedRevision = expectedRevision
 			}).
 			Return(nil).
 			Once()
@@ -1151,6 +1167,9 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		assert.Equal(copiedKey, gotKey)
 		assert.Equal(fixture.mimeType, gotMIMEType)
 		assert.Equal(int64(len(fixture.content)), gotSize)
+		// A whole-content update is last-writer-wins, so the entry update carries no expected
+		// revision (see DESIGN §7.5.2).
+		assert.Nil(gotExpectedRevision)
 	})
 
 	t.Run("always writes to a new final key", func(t *testing.T) {
@@ -1162,7 +1181,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 
 		fixture.mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1201,7 +1220,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 
 		fixture.mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1268,9 +1287,9 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
-			Run(func(_ context.Context, _ string, _ string, mimeType string, _ int64) {
+			Run(func(_ context.Context, _ string, _ string, mimeType string, _ int64, _ *int64) {
 				recordedMIMEType = mimeType
 			}).
 			Return(nil).
@@ -1311,7 +1330,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 
 		fixture.mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1342,7 +1361,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		activeSession := mockdb.NewDatabase(t)
 		activeSession.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1404,7 +1423,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1529,9 +1548,9 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
-			Run(func(_ context.Context, _ string, _ string, _ string, size int64) {
+			Run(func(_ context.Context, _ string, _ string, _ string, size int64, _ *int64) {
 				recordedSize = size
 			}).
 			Return(nil).
@@ -1700,7 +1719,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(dbErr).
 			Once()
@@ -1757,7 +1776,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1816,7 +1835,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()
@@ -1884,7 +1903,7 @@ func TestManagerUpdateArtifactContent(t *testing.T) {
 		mockDatabase := mockdb.NewDatabase(t)
 		mockDatabase.EXPECT().
 			UpdateArtifactObject(
-				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+				mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything,
 			).
 			Return(nil).
 			Once()

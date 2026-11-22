@@ -41,6 +41,96 @@ func (_m *Manager) EXPECT() *Manager_Expecter {
 	return &Manager_Expecter{mock: &_m.Mock}
 }
 
+// CreateTextArtifact provides a mock function for the type Manager
+func (_mock *Manager) CreateTextArtifact(ctx context.Context, workspace models.Workspace, content string, name string, description *string, activeSession db.Database) (models.Artifact, error) {
+	ret := _mock.Called(ctx, workspace, content, name, description, activeSession)
+
+	if len(ret) == 0 {
+		panic("no return value specified for CreateTextArtifact")
+	}
+
+	var r0 models.Artifact
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Workspace, string, string, *string, db.Database) (models.Artifact, error)); ok {
+		return returnFunc(ctx, workspace, content, name, description, activeSession)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Workspace, string, string, *string, db.Database) models.Artifact); ok {
+		r0 = returnFunc(ctx, workspace, content, name, description, activeSession)
+	} else {
+		r0 = ret.Get(0).(models.Artifact)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, models.Workspace, string, string, *string, db.Database) error); ok {
+		r1 = returnFunc(ctx, workspace, content, name, description, activeSession)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// Manager_CreateTextArtifact_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'CreateTextArtifact'
+type Manager_CreateTextArtifact_Call struct {
+	*mock.Call
+}
+
+// CreateTextArtifact is a helper method to define mock.On call
+//   - ctx context.Context
+//   - workspace models.Workspace
+//   - content string
+//   - name string
+//   - description *string
+//   - activeSession db.Database
+func (_e *Manager_Expecter) CreateTextArtifact(ctx interface{}, workspace interface{}, content interface{}, name interface{}, description interface{}, activeSession interface{}) *Manager_CreateTextArtifact_Call {
+	return &Manager_CreateTextArtifact_Call{Call: _e.mock.On("CreateTextArtifact", ctx, workspace, content, name, description, activeSession)}
+}
+
+func (_c *Manager_CreateTextArtifact_Call) Run(run func(ctx context.Context, workspace models.Workspace, content string, name string, description *string, activeSession db.Database)) *Manager_CreateTextArtifact_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 models.Workspace
+		if args[1] != nil {
+			arg1 = args[1].(models.Workspace)
+		}
+		var arg2 string
+		if args[2] != nil {
+			arg2 = args[2].(string)
+		}
+		var arg3 string
+		if args[3] != nil {
+			arg3 = args[3].(string)
+		}
+		var arg4 *string
+		if args[4] != nil {
+			arg4 = args[4].(*string)
+		}
+		var arg5 db.Database
+		if args[5] != nil {
+			arg5 = args[5].(db.Database)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+			arg5,
+		)
+	})
+	return _c
+}
+
+func (_c *Manager_CreateTextArtifact_Call) Return(artifact models.Artifact, err error) *Manager_CreateTextArtifact_Call {
+	_c.Call.Return(artifact, err)
+	return _c
+}
+
+func (_c *Manager_CreateTextArtifact_Call) RunAndReturn(run func(ctx context.Context, workspace models.Workspace, content string, name string, description *string, activeSession db.Database) (models.Artifact, error)) *Manager_CreateTextArtifact_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // DeleteArtifact provides a mock function for the type Manager
 func (_mock *Manager) DeleteArtifact(ctx context.Context, artifactID string, activeSession db.Database) error {
 	ret := _mock.Called(ctx, artifactID, activeSession)
@@ -100,6 +190,84 @@ func (_c *Manager_DeleteArtifact_Call) Return(err error) *Manager_DeleteArtifact
 }
 
 func (_c *Manager_DeleteArtifact_Call) RunAndReturn(run func(ctx context.Context, artifactID string, activeSession db.Database) error) *Manager_DeleteArtifact_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// EditTextArtifact provides a mock function for the type Manager
+func (_mock *Manager) EditTextArtifact(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64) (models.Artifact, error) {
+	ret := _mock.Called(ctx, artifactID, edits, baseRevision)
+
+	if len(ret) == 0 {
+		panic("no return value specified for EditTextArtifact")
+	}
+
+	var r0 models.Artifact
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []models.TextEdit, *int64) (models.Artifact, error)); ok {
+		return returnFunc(ctx, artifactID, edits, baseRevision)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []models.TextEdit, *int64) models.Artifact); ok {
+		r0 = returnFunc(ctx, artifactID, edits, baseRevision)
+	} else {
+		r0 = ret.Get(0).(models.Artifact)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, []models.TextEdit, *int64) error); ok {
+		r1 = returnFunc(ctx, artifactID, edits, baseRevision)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// Manager_EditTextArtifact_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'EditTextArtifact'
+type Manager_EditTextArtifact_Call struct {
+	*mock.Call
+}
+
+// EditTextArtifact is a helper method to define mock.On call
+//   - ctx context.Context
+//   - artifactID string
+//   - edits []models.TextEdit
+//   - baseRevision *int64
+func (_e *Manager_Expecter) EditTextArtifact(ctx interface{}, artifactID interface{}, edits interface{}, baseRevision interface{}) *Manager_EditTextArtifact_Call {
+	return &Manager_EditTextArtifact_Call{Call: _e.mock.On("EditTextArtifact", ctx, artifactID, edits, baseRevision)}
+}
+
+func (_c *Manager_EditTextArtifact_Call) Run(run func(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64)) *Manager_EditTextArtifact_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 []models.TextEdit
+		if args[2] != nil {
+			arg2 = args[2].([]models.TextEdit)
+		}
+		var arg3 *int64
+		if args[3] != nil {
+			arg3 = args[3].(*int64)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+		)
+	})
+	return _c
+}
+
+func (_c *Manager_EditTextArtifact_Call) Return(artifact models.Artifact, err error) *Manager_EditTextArtifact_Call {
+	_c.Call.Return(artifact, err)
+	return _c
+}
+
+func (_c *Manager_EditTextArtifact_Call) RunAndReturn(run func(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64) (models.Artifact, error)) *Manager_EditTextArtifact_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -490,6 +658,84 @@ func (_c *Manager_ListWorkspaceArtifacts_Call) RunAndReturn(run func(ctx context
 	return _c
 }
 
+// ReadTextArtifactContent provides a mock function for the type Manager
+func (_mock *Manager) ReadTextArtifactContent(ctx context.Context, artifact1 models.Artifact, offset int, limit *int) (artifact.TextArtifactContent, error) {
+	ret := _mock.Called(ctx, artifact1, offset, limit)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ReadTextArtifactContent")
+	}
+
+	var r0 artifact.TextArtifactContent
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Artifact, int, *int) (artifact.TextArtifactContent, error)); ok {
+		return returnFunc(ctx, artifact1, offset, limit)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Artifact, int, *int) artifact.TextArtifactContent); ok {
+		r0 = returnFunc(ctx, artifact1, offset, limit)
+	} else {
+		r0 = ret.Get(0).(artifact.TextArtifactContent)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, models.Artifact, int, *int) error); ok {
+		r1 = returnFunc(ctx, artifact1, offset, limit)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// Manager_ReadTextArtifactContent_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ReadTextArtifactContent'
+type Manager_ReadTextArtifactContent_Call struct {
+	*mock.Call
+}
+
+// ReadTextArtifactContent is a helper method to define mock.On call
+//   - ctx context.Context
+//   - artifact1 models.Artifact
+//   - offset int
+//   - limit *int
+func (_e *Manager_Expecter) ReadTextArtifactContent(ctx interface{}, artifact1 interface{}, offset interface{}, limit interface{}) *Manager_ReadTextArtifactContent_Call {
+	return &Manager_ReadTextArtifactContent_Call{Call: _e.mock.On("ReadTextArtifactContent", ctx, artifact1, offset, limit)}
+}
+
+func (_c *Manager_ReadTextArtifactContent_Call) Run(run func(ctx context.Context, artifact1 models.Artifact, offset int, limit *int)) *Manager_ReadTextArtifactContent_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 models.Artifact
+		if args[1] != nil {
+			arg1 = args[1].(models.Artifact)
+		}
+		var arg2 int
+		if args[2] != nil {
+			arg2 = args[2].(int)
+		}
+		var arg3 *int
+		if args[3] != nil {
+			arg3 = args[3].(*int)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+		)
+	})
+	return _c
+}
+
+func (_c *Manager_ReadTextArtifactContent_Call) Return(textArtifactContent artifact.TextArtifactContent, err error) *Manager_ReadTextArtifactContent_Call {
+	_c.Call.Return(textArtifactContent, err)
+	return _c
+}
+
+func (_c *Manager_ReadTextArtifactContent_Call) RunAndReturn(run func(ctx context.Context, artifact1 models.Artifact, offset int, limit *int) (artifact.TextArtifactContent, error)) *Manager_ReadTextArtifactContent_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // RegisterNewArtifact provides a mock function for the type Manager
 func (_mock *Manager) RegisterNewArtifact(ctx context.Context, workspace models.Workspace, stagingObjKey string, name string, description *string, activeSession db.Database) (models.Artifact, error) {
 	ret := _mock.Called(ctx, workspace, stagingObjKey, name, description, activeSession)
@@ -654,6 +900,168 @@ func (_c *Manager_RenameArtifact_Call) Return(artifact1 models.Artifact, err err
 }
 
 func (_c *Manager_RenameArtifact_Call) RunAndReturn(run func(ctx context.Context, artifactID string, newName string, activeSession db.Database) (models.Artifact, error)) *Manager_RenameArtifact_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// StageTextBlob provides a mock function for the type Manager
+func (_mock *Manager) StageTextBlob(ctx context.Context, workspace models.Workspace, content string) (string, error) {
+	ret := _mock.Called(ctx, workspace, content)
+
+	if len(ret) == 0 {
+		panic("no return value specified for StageTextBlob")
+	}
+
+	var r0 string
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Workspace, string) (string, error)); ok {
+		return returnFunc(ctx, workspace, content)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, models.Workspace, string) string); ok {
+		r0 = returnFunc(ctx, workspace, content)
+	} else {
+		r0 = ret.Get(0).(string)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, models.Workspace, string) error); ok {
+		r1 = returnFunc(ctx, workspace, content)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// Manager_StageTextBlob_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'StageTextBlob'
+type Manager_StageTextBlob_Call struct {
+	*mock.Call
+}
+
+// StageTextBlob is a helper method to define mock.On call
+//   - ctx context.Context
+//   - workspace models.Workspace
+//   - content string
+func (_e *Manager_Expecter) StageTextBlob(ctx interface{}, workspace interface{}, content interface{}) *Manager_StageTextBlob_Call {
+	return &Manager_StageTextBlob_Call{Call: _e.mock.On("StageTextBlob", ctx, workspace, content)}
+}
+
+func (_c *Manager_StageTextBlob_Call) Run(run func(ctx context.Context, workspace models.Workspace, content string)) *Manager_StageTextBlob_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 models.Workspace
+		if args[1] != nil {
+			arg1 = args[1].(models.Workspace)
+		}
+		var arg2 string
+		if args[2] != nil {
+			arg2 = args[2].(string)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+		)
+	})
+	return _c
+}
+
+func (_c *Manager_StageTextBlob_Call) Return(s string, err error) *Manager_StageTextBlob_Call {
+	_c.Call.Return(s, err)
+	return _c
+}
+
+func (_c *Manager_StageTextBlob_Call) RunAndReturn(run func(ctx context.Context, workspace models.Workspace, content string) (string, error)) *Manager_StageTextBlob_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// StageUpdatedArtifactText provides a mock function for the type Manager
+func (_mock *Manager) StageUpdatedArtifactText(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64, activeSession db.Database) (models.Artifact, string, error) {
+	ret := _mock.Called(ctx, artifactID, edits, baseRevision, activeSession)
+
+	if len(ret) == 0 {
+		panic("no return value specified for StageUpdatedArtifactText")
+	}
+
+	var r0 models.Artifact
+	var r1 string
+	var r2 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []models.TextEdit, *int64, db.Database) (models.Artifact, string, error)); ok {
+		return returnFunc(ctx, artifactID, edits, baseRevision, activeSession)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []models.TextEdit, *int64, db.Database) models.Artifact); ok {
+		r0 = returnFunc(ctx, artifactID, edits, baseRevision, activeSession)
+	} else {
+		r0 = ret.Get(0).(models.Artifact)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string, []models.TextEdit, *int64, db.Database) string); ok {
+		r1 = returnFunc(ctx, artifactID, edits, baseRevision, activeSession)
+	} else {
+		r1 = ret.Get(1).(string)
+	}
+	if returnFunc, ok := ret.Get(2).(func(context.Context, string, []models.TextEdit, *int64, db.Database) error); ok {
+		r2 = returnFunc(ctx, artifactID, edits, baseRevision, activeSession)
+	} else {
+		r2 = ret.Error(2)
+	}
+	return r0, r1, r2
+}
+
+// Manager_StageUpdatedArtifactText_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'StageUpdatedArtifactText'
+type Manager_StageUpdatedArtifactText_Call struct {
+	*mock.Call
+}
+
+// StageUpdatedArtifactText is a helper method to define mock.On call
+//   - ctx context.Context
+//   - artifactID string
+//   - edits []models.TextEdit
+//   - baseRevision *int64
+//   - activeSession db.Database
+func (_e *Manager_Expecter) StageUpdatedArtifactText(ctx interface{}, artifactID interface{}, edits interface{}, baseRevision interface{}, activeSession interface{}) *Manager_StageUpdatedArtifactText_Call {
+	return &Manager_StageUpdatedArtifactText_Call{Call: _e.mock.On("StageUpdatedArtifactText", ctx, artifactID, edits, baseRevision, activeSession)}
+}
+
+func (_c *Manager_StageUpdatedArtifactText_Call) Run(run func(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64, activeSession db.Database)) *Manager_StageUpdatedArtifactText_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 []models.TextEdit
+		if args[2] != nil {
+			arg2 = args[2].([]models.TextEdit)
+		}
+		var arg3 *int64
+		if args[3] != nil {
+			arg3 = args[3].(*int64)
+		}
+		var arg4 db.Database
+		if args[4] != nil {
+			arg4 = args[4].(db.Database)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+			arg3,
+			arg4,
+		)
+	})
+	return _c
+}
+
+func (_c *Manager_StageUpdatedArtifactText_Call) Return(artifact1 models.Artifact, s string, err error) *Manager_StageUpdatedArtifactText_Call {
+	_c.Call.Return(artifact1, s, err)
+	return _c
+}
+
+func (_c *Manager_StageUpdatedArtifactText_Call) RunAndReturn(run func(ctx context.Context, artifactID string, edits []models.TextEdit, baseRevision *int64, activeSession db.Database) (models.Artifact, string, error)) *Manager_StageUpdatedArtifactText_Call {
 	_c.Call.Return(run)
 	return _c
 }
