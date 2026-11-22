@@ -26,8 +26,9 @@ func (h MCPHandler) registerListArtifactsTool(server *mcp.Server) error {
 	toolName := "list_artifacts"
 	toolDescription :=
 		"List the artifacts stored in a workspace, optionally filtered by name or state, with " +
-			"paging. Metadata only - use download_artifact to get an artifact's content. This is " +
-			"also how you check whether a particular artifact exists: list with its name."
+			"paging. Metadata only - use download_artifact to get an artifact's content, or " +
+			"read_text_artifact for a plain text artifact. This is also how you check whether a " +
+			"particular artifact exists: list with its name."
 
 	return goutils.MCPAddTool(
 		&h.MCPHandler,
@@ -334,6 +335,193 @@ func (h MCPHandler) registerRenameArtifactTool(server *mcp.Server) error {
 				"artifact '%s' of workspace '%s' renamed to '%s'",
 				in.ArtifactName, in.WorkspaceName, in.NewName,
 			)), nil, nil
+		},
+	)
+}
+
+// mcpTextToolNote the sentence every text tool's description carries: these tools move content
+// through the call, never through the volume (see DESIGN §6.6, §7.6).
+const mcpTextToolNote = "No volume or transfer container is involved, so this works whatever " +
+	"the workspace's volume state."
+
+// registerReadTextArtifactTool register the read_text_artifact tool.
+func (h MCPHandler) registerReadTextArtifactTool(server *mcp.Server) error {
+	toolName := "read_text_artifact"
+	toolDescription :=
+		"Read lines of a plain text artifact straight into this result. Only a RECORDED " +
+			"artifact holding plain text - valid UTF-8, with no control characters other than " +
+			"tab and line breaks - can be read; use download_artifact for anything else. Lines " +
+			"come back with LF line endings, whatever the artifact uses. The content is the " +
+			"artifact's exact text, so any part of it can be copied into edit_text_artifact's " +
+			"old_text as is. The revision returned is what to pass as base_revision to make an " +
+			"edit fail if anything changed since this read. " + mcpTextToolNote
+
+	return goutils.MCPAddTool(
+		&h.MCPHandler,
+		server,
+		&mcp.Tool{Name: toolName, Description: toolDescription},
+		func(
+			ctxt context.Context, _ *mcp.CallToolRequest, in MCPReadTextArtifactParams,
+		) (*mcp.CallToolResult, MCPReadTextArtifactResp, error) {
+			if err := h.validator.Struct(&in); err != nil {
+				return nil, MCPReadTextArtifactResp{}, goutils.NewValidationError(
+					"read_text_artifact parameters are not valid", err, true,
+				)
+			}
+
+			_, artifactEntry, err := h.resolveArtifact(ctxt, in.WorkspaceName, in.ArtifactName)
+			if err != nil {
+				return nil, MCPReadTextArtifactResp{}, goutils.NewRuntimeError(
+					fmt.Sprintf(
+						"Failed to fetch artifact '%s' of workspace '%s'",
+						in.ArtifactName, in.WorkspaceName,
+					), err, true,
+				)
+			}
+
+			offset := 1
+			if in.Offset != nil {
+				offset = *in.Offset
+			}
+
+			// The state, MIME type, size, and plain text checks all live in the manager, so none
+			// is repeated here (see DESIGN §7.6.1).
+			read, err := h.artifactMgr.ReadTextArtifactContent(
+				ctxt, artifactEntry, offset, in.Limit,
+			)
+			if err != nil {
+				return nil, MCPReadTextArtifactResp{}, goutils.NewRuntimeError(
+					fmt.Sprintf(
+						"Failed to read artifact '%s' of workspace '%s'",
+						in.ArtifactName, in.WorkspaceName,
+					), err, true,
+				)
+			}
+
+			return nil, NewMCPReadTextArtifactResp(read, in.LineNumbers), nil
+		},
+	)
+}
+
+// registerCreateTextArtifactTool register the create_text_artifact tool.
+//
+// The inline counterpart of upload_artifact: the content arrives in the call, so no container
+// runs (see DESIGN §6.6, §7.6.5).
+func (h MCPHandler) registerCreateTextArtifactTool(server *mcp.Server) error {
+	toolName := "create_text_artifact"
+	toolDescription :=
+		"Store text sent in this call as a NEW plain text artifact. The name must not already " +
+			"be taken in this workspace - use edit_text_artifact to change an existing text " +
+			"artifact. The content is stored exactly as given, and must be plain text. The new " +
+			"artifact starts at revision 1. " + mcpTextToolNote
+
+	return goutils.MCPAddTool(
+		&h.MCPHandler,
+		server,
+		&mcp.Tool{Name: toolName, Description: toolDescription},
+		func(
+			ctxt context.Context, _ *mcp.CallToolRequest, in MCPCreateTextArtifactParams,
+		) (*mcp.CallToolResult, MCPCreateTextArtifactResp, error) {
+			if err := h.validator.Struct(&in); err != nil {
+				return nil, MCPCreateTextArtifactResp{}, goutils.NewValidationError(
+					"create_text_artifact parameters are not valid", err, true,
+				)
+			}
+
+			workspaceEntry, err := h.resolveWorkspace(ctxt, in.WorkspaceName)
+			if err != nil {
+				return nil, MCPCreateTextArtifactResp{}, goutils.NewRuntimeError(
+					"Failed to fetch workspace '"+in.WorkspaceName+"'", err, true,
+				)
+			}
+
+			// The manager pre-checks the name is free before staging anything, so no
+			// availability check is made here (see DESIGN §7.6.5).
+			created, err := h.artifactMgr.CreateTextArtifact(
+				ctxt, workspaceEntry, in.Content, in.ArtifactName, in.Description, nil,
+			)
+			if err != nil {
+				return nil, MCPCreateTextArtifactResp{}, goutils.NewRuntimeError(
+					fmt.Sprintf(
+						"Failed to create artifact '%s' in workspace '%s'",
+						in.ArtifactName, in.WorkspaceName,
+					), err, true,
+				)
+			}
+
+			// One sentence for both results, so the two copies cannot drift apart.
+			message := fmt.Sprintf(
+				"artifact '%s' created in workspace '%s' at revision %d",
+				in.ArtifactName, in.WorkspaceName, created.Revision,
+			)
+			return goutils.MCPTextResult(message),
+				MCPCreateTextArtifactResp{Message: message, Revision: created.Revision},
+				nil
+		},
+	)
+}
+
+// registerEditTextArtifactTool register the edit_text_artifact tool.
+//
+// Exact-text replacement, committed as a compare-and-swap on the artifact's revision (see
+// DESIGN §7.5.2, §7.6.4).
+func (h MCPHandler) registerEditTextArtifactTool(server *mcp.Server) error {
+	toolName := "edit_text_artifact"
+	toolDescription :=
+		"Change part of an existing plain text artifact by exact-text replacement, the way you " +
+			"edit a file. Read it first with read_text_artifact. Each edit's old_text must match " +
+			"the artifact's current text exactly, whitespace included, and be found exactly once " +
+			"unless replace_all is set. Edits apply in order, and all or nothing. Match against " +
+			"LF line endings; the artifact keeps its own line ending. If someone else changes the " +
+			"artifact at the same time, your edits are applied again to the newer text, and fail " +
+			"if an old_text no longer matches; pass base_revision to fail instead whenever " +
+			"anything changed since your read. Returns the new revision. " + mcpTextToolNote
+
+	return goutils.MCPAddTool(
+		&h.MCPHandler,
+		server,
+		&mcp.Tool{Name: toolName, Description: toolDescription},
+		func(
+			ctxt context.Context, _ *mcp.CallToolRequest, in MCPEditTextArtifactParams,
+		) (*mcp.CallToolResult, MCPEditTextArtifactResp, error) {
+			if err := h.validator.Struct(&in); err != nil {
+				return nil, MCPEditTextArtifactResp{}, goutils.NewValidationError(
+					"edit_text_artifact parameters are not valid", err, true,
+				)
+			}
+
+			_, artifactEntry, err := h.resolveArtifact(ctxt, in.WorkspaceName, in.ArtifactName)
+			if err != nil {
+				return nil, MCPEditTextArtifactResp{}, goutils.NewRuntimeError(
+					fmt.Sprintf(
+						"Failed to fetch artifact '%s' of workspace '%s'",
+						in.ArtifactName, in.WorkspaceName,
+					), err, true,
+				)
+			}
+
+			// By ID: the manager reads the entry afresh on every attempt, so the one resolved
+			// here only supplies the ID (see DESIGN §3).
+			updated, err := h.artifactMgr.EditTextArtifact(
+				ctxt, artifactEntry.ID, in.Edits, in.BaseRevision,
+			)
+			if err != nil {
+				return nil, MCPEditTextArtifactResp{}, goutils.NewRuntimeError(
+					fmt.Sprintf(
+						"Failed to edit artifact '%s' of workspace '%s'",
+						in.ArtifactName, in.WorkspaceName,
+					), err, true,
+				)
+			}
+
+			// One sentence for both results, so the two copies cannot drift apart.
+			message := fmt.Sprintf(
+				"artifact '%s' of workspace '%s' edited; it is now at revision %d",
+				in.ArtifactName, in.WorkspaceName, updated.Revision,
+			)
+			return goutils.MCPTextResult(message),
+				MCPEditTextArtifactResp{Message: message, Revision: updated.Revision},
+				nil
 		},
 	)
 }

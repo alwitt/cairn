@@ -3,9 +3,11 @@ package api_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/alwitt/cairn/api"
+	"github.com/alwitt/cairn/artifact"
 	"github.com/alwitt/cairn/db"
 	mockartifact "github.com/alwitt/cairn/mocks/artifact"
 	mockworkspace "github.com/alwitt/cairn/mocks/workspace"
@@ -27,6 +29,9 @@ var mcpToolNames = []string{
 	"update_artifact",
 	"delete_artifact",
 	"rename_artifact",
+	"read_text_artifact",
+	"create_text_artifact",
+	"edit_text_artifact",
 }
 
 // mcpToolMocks the mocked collaborators an MCP handler under test drives. Every one fails the
@@ -861,5 +866,395 @@ func TestMCPRenameArtifactTool(t *testing.T) {
 			"new_name":       "taken-name",
 		})
 		assert.True(result.IsError)
+	})
+}
+
+// expectMCPArtifactResolved arrange for a workspace name then an artifact name to resolve to
+// their entries.
+func expectMCPArtifactResolved(
+	mocks mcpToolMocks, workspace models.Workspace, entry models.Artifact,
+) {
+	mocks.workspaces.EXPECT().
+		GetWorkspaceByName(mock.Anything, workspace.Name, nil).
+		Return(workspace, 0, nil).
+		Once()
+	mocks.artifacts.EXPECT().
+		GetArtifactByName(mock.Anything, workspace, entry.Name, nil).
+		Return(entry, nil).
+		Once()
+}
+
+// TestMCPReadTextArtifactTool validates the read_text_artifact tool.
+func TestMCPReadTextArtifactTool(t *testing.T) {
+	// Case 1: with no range given, the read starts at line 1 with no limit, and the revision the
+	// agent is shown is the one the content was read from.
+	t.Run("resolves the artifact then reads from line 1", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateNone)
+		entry := mcpSampleArtifact(workspace.ID, "notes", nil)
+		readFrom := entry
+		readFrom.Revision = entry.Revision + 1
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			ReadTextArtifactContent(mock.Anything, entry, 1, (*int)(nil)).
+			Return(artifact.TextArtifactContent{
+				Artifact:   readFrom,
+				Content:    "one\ntwo\n",
+				StartLine:  1,
+				TotalLines: 2,
+				LineEnding: models.TextLineEndingLF,
+			}, nil).
+			Once()
+
+		result := callMCPTool(t, session, "read_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+		})
+		assert.False(result.IsError)
+
+		var decoded api.MCPReadTextArtifactResp
+		decodeMCPStructured(t, result, &decoded)
+		assert.Equal("one\ntwo\n", decoded.Content)
+		assert.Equal(1, decoded.StartLine)
+		assert.Equal(2, decoded.TotalLines)
+		assert.Equal(readFrom.Revision, decoded.Revision)
+		assert.Equal(models.TextLineEndingLF, decoded.LineEnding)
+	})
+
+	// Case 2: an explicit range is passed through, and line numbers are added on request.
+	t.Run("passes the range through and numbers lines", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+		entry := mcpSampleArtifact(workspace.ID, "notes", nil)
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			ReadTextArtifactContent(
+				mock.Anything,
+				entry,
+				2,
+				mock.MatchedBy(func(limit *int) bool { return limit != nil && *limit == 1 }),
+			).
+			Return(artifact.TextArtifactContent{
+				Artifact:   entry,
+				Content:    "two\n",
+				StartLine:  2,
+				TotalLines: 3,
+				LineEnding: models.TextLineEndingCRLF,
+			}, nil).
+			Once()
+
+		result := callMCPTool(t, session, "read_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+			"offset":         2,
+			"limit":          1,
+			"line_numbers":   true,
+		})
+		assert.False(result.IsError)
+
+		var decoded api.MCPReadTextArtifactResp
+		decodeMCPStructured(t, result, &decoded)
+		assert.Equal("2\ttwo\n", decoded.Content)
+		assert.Equal(models.TextLineEndingCRLF, decoded.LineEnding)
+	})
+
+	// Case 3: lines are numbered from 1, so a zero offset is rejected before any lookup.
+	t.Run("rejects a zero offset before any lookup", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, _ := buildMCPToolSession(t)
+
+		result := callMCPTool(t, session, "read_text_artifact", map[string]interface{}{
+			"workspace_name": "unit-test-ws",
+			"artifact_name":  "notes",
+			"offset":         0,
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "read_text_artifact parameters are not valid")
+	})
+
+	// Case 4: an unknown artifact is answered before any read.
+	t.Run("refuses an unknown artifact before reading", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+
+		mocks.workspaces.EXPECT().
+			GetWorkspaceByName(mock.Anything, workspace.Name, nil).
+			Return(workspace, 0, nil).
+			Once()
+		mocks.artifacts.EXPECT().
+			GetArtifactByName(mock.Anything, workspace, "no-such-artifact", nil).
+			Return(models.Artifact{}, artifactDBFailure(unknownArtifact("no-such-artifact"))).
+			Once()
+
+		result := callMCPTool(t, session, "read_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  "no-such-artifact",
+		})
+		assert.True(result.IsError)
+	})
+
+	// Case 5: the manager owns the plain text checks, and its reason reaches the agent.
+	t.Run("surfaces the manager's refusal", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+		entry := mcpSampleArtifact(workspace.ID, "archive", nil)
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			ReadTextArtifactContent(mock.Anything, entry, 1, (*int)(nil)).
+			Return(artifact.TextArtifactContent{}, artifactMgrFailure(goutils.NewBadInputError(
+				"artifact is 'application/zip', not a plain text artifact", nil, true,
+			))).
+			Once()
+
+		result := callMCPTool(t, session, "read_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "not a plain text artifact")
+	})
+}
+
+// TestMCPCreateTextArtifactTool validates the create_text_artifact tool.
+func TestMCPCreateTextArtifactTool(t *testing.T) {
+	// Case 1: the workspace is resolved and the manager is handed the content, the new name, and
+	// the description. No artifact lookup happens - the manager pre-checks the name itself. The
+	// agent gets both the confirmation and the revision as a field.
+	t.Run("resolves the workspace then creates", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateNone)
+		description := "running notes"
+		content := "first line\r\nsecond line\r\n"
+		created := mcpSampleArtifact(workspace.ID, "notes", &description)
+		created.Revision = 1
+
+		mocks.workspaces.EXPECT().
+			GetWorkspaceByName(mock.Anything, workspace.Name, nil).
+			Return(workspace, 0, nil).
+			Once()
+		mocks.artifacts.EXPECT().
+			CreateTextArtifact(mock.Anything, workspace, content, "notes", &description, nil).
+			Return(created, nil).
+			Once()
+
+		result := callMCPTool(t, session, "create_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  "notes",
+			"content":        content,
+			"description":    description,
+		})
+		assert.False(result.IsError)
+
+		confirmation := mcpResultText(t, result)
+		assert.Contains(confirmation, "notes")
+		assert.Contains(confirmation, workspace.Name)
+		assert.Contains(confirmation, "revision 1")
+
+		// the confirmation is repeated for clients that show only the structured result
+		var decoded api.MCPCreateTextArtifactResp
+		decodeMCPStructured(t, result, &decoded)
+		assert.Equal(int64(1), decoded.Revision)
+		assert.Equal(confirmation, decoded.Message)
+	})
+
+	// Case 2: the description is optional, and its absence reaches the manager as nil. An empty
+	// file is a legitimate artifact, so empty content is passed through too.
+	t.Run("carries an absent description through as nil", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+
+		mocks.workspaces.EXPECT().
+			GetWorkspaceByName(mock.Anything, workspace.Name, nil).
+			Return(workspace, 0, nil).
+			Once()
+		mocks.artifacts.EXPECT().
+			CreateTextArtifact(mock.Anything, workspace, "", "notes", (*string)(nil), nil).
+			Return(mcpSampleArtifact(workspace.ID, "notes", nil), nil).
+			Once()
+
+		result := callMCPTool(t, session, "create_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  "notes",
+			"content":        "",
+		})
+		assert.False(result.IsError)
+	})
+
+	// Case 3: a name outside the permitted charset never reaches the manager.
+	t.Run("rejects a malformed artifact name before the manager", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, _ := buildMCPToolSession(t)
+
+		result := callMCPTool(t, session, "create_text_artifact", map[string]interface{}{
+			"workspace_name": "unit-test-ws",
+			"artifact_name":  "notes.txt",
+			"content":        "hello\n",
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "create_text_artifact parameters are not valid")
+	})
+
+	// Case 4: the manager's refusal of a taken name is what the agent is told.
+	t.Run("surfaces the manager's refusal", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+
+		mocks.workspaces.EXPECT().
+			GetWorkspaceByName(mock.Anything, workspace.Name, nil).
+			Return(workspace, 0, nil).
+			Once()
+		mocks.artifacts.EXPECT().
+			CreateTextArtifact(mock.Anything, workspace, mock.Anything, "notes", mock.Anything, nil).
+			Return(models.Artifact{}, artifactMgrFailure(goutils.NewBadInputError(
+				"workspace already has an artifact named 'notes'", nil, true,
+			))).
+			Once()
+
+		result := callMCPTool(t, session, "create_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  "notes",
+			"content":        "hello\n",
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "already has an artifact named 'notes'")
+	})
+}
+
+// TestMCPEditTextArtifactTool validates the edit_text_artifact tool.
+func TestMCPEditTextArtifactTool(t *testing.T) {
+	// Case 1: the artifact is resolved, then edited by ID with the edits as sent. An omitted
+	// replace_all arrives as false, and an omitted base_revision as nil.
+	t.Run("resolves the artifact then edits by ID", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateNone)
+		entry := mcpSampleArtifact(workspace.ID, "notes", nil)
+		updated := entry
+		updated.Revision = entry.Revision + 1
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			EditTextArtifact(
+				mock.Anything,
+				entry.ID,
+				[]models.TextEdit{
+					{OldText: "port: 8080", NewText: "port: 9090"},
+					{OldText: "debug: false", NewText: "debug: true", ReplaceAll: true},
+				},
+				(*int64)(nil),
+			).
+			Return(updated, nil).
+			Once()
+
+		result := callMCPTool(t, session, "edit_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+			"edits": []map[string]interface{}{
+				{"old_text": "port: 8080", "new_text": "port: 9090"},
+				{"old_text": "debug: false", "new_text": "debug: true", "replace_all": true},
+			},
+		})
+		assert.False(result.IsError)
+
+		confirmation := mcpResultText(t, result)
+		assert.Contains(confirmation, entry.Name)
+		assert.Contains(confirmation, fmt.Sprintf("revision %d", updated.Revision))
+
+		// the confirmation is repeated for clients that show only the structured result
+		var decoded api.MCPEditTextArtifactResp
+		decodeMCPStructured(t, result, &decoded)
+		assert.Equal(updated.Revision, decoded.Revision)
+		assert.Equal(confirmation, decoded.Message)
+	})
+
+	// Case 2: a base revision is passed through for a strict edit.
+	t.Run("passes a base revision through", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+		entry := mcpSampleArtifact(workspace.ID, "notes", nil)
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			EditTextArtifact(
+				mock.Anything,
+				entry.ID,
+				mock.Anything,
+				mock.MatchedBy(func(base *int64) bool { return base != nil && *base == entry.Revision }),
+			).
+			Return(entry, nil).
+			Once()
+
+		result := callMCPTool(t, session, "edit_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+			"edits":          []map[string]interface{}{{"old_text": "a", "new_text": "b"}},
+			"base_revision":  entry.Revision,
+		})
+		assert.False(result.IsError)
+	})
+
+	// Case 3: an empty edit list is rejected before any lookup.
+	t.Run("rejects an empty edit list before any lookup", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, _ := buildMCPToolSession(t)
+
+		result := callMCPTool(t, session, "edit_text_artifact", map[string]interface{}{
+			"workspace_name": "unit-test-ws",
+			"artifact_name":  "notes",
+			"edits":          []map[string]interface{}{},
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "edit_text_artifact parameters are not valid")
+	})
+
+	// Case 4: a strict edit that lost to another writer is refused, and the agent is told why.
+	t.Run("surfaces a revision conflict", func(t *testing.T) {
+		assert := assert.New(t)
+
+		session, mocks := buildMCPToolSession(t)
+		workspace := mcpSampleWorkspace("unit-test-ws", models.WorkspaceVolumeStateReady)
+		entry := mcpSampleArtifact(workspace.ID, "notes", nil)
+
+		expectMCPArtifactResolved(mocks, workspace, entry)
+		mocks.artifacts.EXPECT().
+			EditTextArtifact(mock.Anything, entry.ID, mock.Anything, mock.Anything).
+			Return(models.Artifact{}, artifactMgrFailure(models.NewArtifactRevisionConflictError(
+				"artifact is at revision 4, not the base revision 3",
+				goutils.NewConsistencyError("content changed", nil, false),
+				true,
+			))).
+			Once()
+
+		result := callMCPTool(t, session, "edit_text_artifact", map[string]interface{}{
+			"workspace_name": workspace.Name,
+			"artifact_name":  entry.Name,
+			"edits":          []map[string]interface{}{{"old_text": "a", "new_text": "b"}},
+			"base_revision":  3,
+		})
+		assert.True(result.IsError)
+		assert.Contains(mcpResultText(t, result), "not the base revision 3")
 	})
 }

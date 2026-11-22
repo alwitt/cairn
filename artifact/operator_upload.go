@@ -3,7 +3,6 @@ package artifact
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 
@@ -77,7 +76,7 @@ func (o *dockerOperatorImpl) UploadArtifact(
 		)
 	}
 
-	if err := o.verifyArtifactNameFree(ctx, workspace, name, activeSession); err != nil {
+	if err := verifyArtifactNameFree(ctx, o.manager, workspace, name, activeSession); err != nil {
 		return models.Artifact{}, failure(err)
 	}
 
@@ -175,46 +174,6 @@ func (o *dockerOperatorImpl) UpdateArtifact(
 		Debug("Updated artifact content from workspace volume")
 
 	return entry, nil
-}
-
-/*
-verifyArtifactNameFree confirm no artifact by this name exists in the workspace yet.
-
-A pre-sidecar fail-fast (see DESIGN §7.3): spending two container runs only to be rejected by
-the database's uniqueness constraint is the waste this exists to avoid. The constraint is
-still the real guard - this loses to a caller that races another between here and the insert,
-and is meant to.
-
-The three-way branch is the point of the function. Treating any error as "the name is free"
-would turn a database outage into two wasted container runs followed by a constraint
-violation, which is exactly the outcome being avoided.
-
-	@param ctx context.Context - execution context
-	@param workspace models.Workspace - workspace this is for
-	@param name string - the artifact name to check
-	@param activeSession db.Database - if set, an existing open DB transaction to work within
-*/
-func (o *dockerOperatorImpl) verifyArtifactNameFree(
-	ctx context.Context, workspace models.Workspace, name string, activeSession db.Database,
-) error {
-	_, err := o.manager.GetArtifactByName(ctx, workspace, name, activeSession)
-
-	if err == nil {
-		return goutils.NewBadInputError(
-			fmt.Sprintf(
-				"workspace %s already has an artifact named '%s'", workspace.ID, name,
-			), nil, true,
-		)
-	}
-
-	// Not-found is the success case here. It survives the manager's wrapping because the
-	// goutils error types unwrap, so matching on the type reaches it through the chain.
-	var notFound goutils.NotFoundError
-	if errors.As(err, &notFound) {
-		return nil
-	}
-
-	return err
 }
 
 /*

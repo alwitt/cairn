@@ -27,6 +27,8 @@ func unitTestStoreConfig() models.ArtifactStorageConfig {
 		UploadPutURLTTLSecs:      300,
 		DownloadGetURLMaxTTLSecs: 600,
 		MaxObjectSizeBytes:       1024 * 1024,
+		MaxTextSizeBytes:         1024,
+		TextMaxAttempts:          3,
 		Prefix:                   models.ArtifactKeyConfig{StagingPrefix: "staging", StorePrefix: "store"},
 	}
 }

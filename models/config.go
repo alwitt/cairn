@@ -318,6 +318,15 @@ type ArtifactStorageConfig struct {
 	// an error rather than something to engineer around (see DESIGN §5.2).
 	MaxObjectSizeBytes int64 `mapstructure:"maxObjectSize" json:"maxObjectSize" validate:"required,gt=0"`
 
+	// MaxTextSizeBytes the size cap for any artifact the text tools read, create, or edit. Far
+	// below MaxObjectSizeBytes, because text content travels inside the MCP request and the
+	// service holds the whole file in memory to edit it (see DESIGN §6.6).
+	MaxTextSizeBytes int64 `mapstructure:"maxTextSize" json:"maxTextSize" validate:"required,gt=0,ltefield=MaxObjectSizeBytes"`
+
+	// TextMaxAttempts how many times a text edit, or a text read, starts over when the artifact
+	// changes underneath it. 1 means it never starts over (see DESIGN §7.5.2).
+	TextMaxAttempts int `mapstructure:"textMaxAttempts" json:"textMaxAttempts" validate:"required,gte=1"`
+
 	// Prefix object key prefix config
 	Prefix ArtifactKeyConfig `mapstructure:"prefix" json:"prefix" validate:"required"`
 }
@@ -681,6 +690,12 @@ func InstallDefaultServerConfigValues() {
 	// well under the object store's own single PUT limit - and low enough that an object of
 	// this size still transfers inside a sidecar run.
 	viper.SetDefault("artifact.store.maxObjectSize", 1024*1024*1024)
+	// 1 MiB. A text file of this size is already far more than an agent can usefully read or
+	// edit in one tool call, and the whole of it sits in memory while an edit is applied.
+	viper.SetDefault("artifact.store.maxTextSize", 1024*1024)
+	// A conflict only arises when another writer commits inside the few calls one edit takes,
+	// so a handful of attempts rides out ordinary contention without masking a hot artifact.
+	viper.SetDefault("artifact.store.textMaxAttempts", 3)
 	viper.SetDefault("artifact.store.prefix.staging", "staging")
 	viper.SetDefault("artifact.store.prefix.store", "store")
 

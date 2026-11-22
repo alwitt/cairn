@@ -179,6 +179,7 @@ for reconciliation when Docker drifts from the column.
 | `MIMEType` | string | **Server-sniffed** content type (§6), stored on the row so `list`/`fetch` report it without a `HeadObject`. **Advisory metadata only** — a label/download-name hint, **not a security boundary** (serving forces `attachment`, §6/§6.5). Also set as the object's `Content-Type`. |
 | `Size` | int64 | Size in bytes (from `GetObjectStat` on the staging object, §6.1). |
 | `State` | string enum | `RECORDED` or `MISSING_OBJECT`. See §2.2.1. |
+| `Revision` | int64 | Content counter: `1` at register, `+1` on every content change (update §6.3, edit §7.6). Never lowered or reset. Renames and description changes leave it alone. **Shown to agents** — it is a counter, not an identifier, so §3 still holds. Backs the edit compare-and-swap (§7.5.2). |
 | `CreatedAt` | timestamp | — |
 | `UpdatedAt` | timestamp | — |
 
@@ -186,6 +187,8 @@ for reconciliation when Docker drifts from the column.
   name** — so **rename is a pure DB update** (no object move).
 - **Mutable** ≈ `Name`, `Description`. **Immutable** ≈ `ID`, `WorkspaceID`,
   `ObjectKey` (replaced wholesale on update, §6.3, never edited in place).
+  `Revision` moves only with `ObjectKey`, in the same row update, and only upward
+  (§7.5.2).
 
 #### 2.2.1 Artifact `State` enum
 ```
@@ -582,7 +585,8 @@ step 2 — staging-key ownership verify, then the single-PUT size cap via
 `GetObjectStat`) but does **not** create a new DB row:
 - New staging upload → **verify staging-key prefix** → **enforce size cap**
   (`GetObjectStat`) → sniff → **`CopyObject` to a NEW final key** → **update the
-  row's `object_key`/MIME/size** to the new key → delete staging.
+  row's `object_key`/MIME/size** to the new key, bumping `revision` in the same
+  update (§7.5.2) → delete staging.
 - The flip from old key to new key is a single row update → **atomic** (readers
   always see a complete object).
 - The **old object is orphaned by design** → reaped by the maintenance system
@@ -691,6 +695,38 @@ bound PUT (§6.1) cannot guarantee.
   already makes content-sniffing moot for the execution path, so `nosniff` is
   defense-in-depth on top, not the primary control.
 
+### 6.6 Inline text path (MCP, no sidecar)
+The text tools (§7.6) move bytes between the **tool call** and the object store. The
+volume is not involved, so no sidecar is either: the content arrives in, or leaves in,
+the MCP request itself, and the service — the sole credential holder (§5.1) — reads
+and writes the object directly. No presigned URL is minted.
+
+They reuse the existing core functions rather than adding a third write path:
+
+| Tool | Flow |
+|---|---|
+| `create_text_artifact` | Name pre-check (§7.6.5) → text checks (§7.6.1), including an in-memory sniff that must report a text type → `PutObject` to a server-generated staging key → `RegisterNewArtifact` (§6.1 step 2). Starts at revision `1`. |
+| `edit_text_artifact` | Load the row → `GET` its current object → text checks → apply the edits → `PutObject` to a staging key → `UpdateArtifactContent` with an **expected revision**, which makes the row update a compare-and-swap (§7.5.2). |
+| `read_text_artifact` | Load the row (must be `RECORDED`) → `GET` its object → text checks → return the requested lines. Nothing is written. |
+
+The staging-key ownership check, size cap, server-side MIME sniff, new final key, and
+row flip all stay inside the core functions, so the inline path inherits them unchanged
+and cannot drift from the REST and volume paths.
+
+**Text size cap.** A separate `artifact.store.maxTextSize` (default 1 MiB; must not
+exceed `maxObjectSize`) bounds every text tool. Writes check it before anything is
+staged; reads check it against the row's `Size` before fetching the object. It is far
+smaller than the object cap because the content travels inside the MCP JSON, and the
+service holds the whole file in memory to edit it.
+
+**Attempt limit.** `artifact.store.textMaxAttempts` (default 3) bounds how many times an
+edit, or a read, starts over when the artifact changes underneath it (§7.5.2). `1` means
+it never starts over.
+
+**A volume copy does not change.** These tools change the artifact. A copy already
+written into a volume by `download_artifact` is a separate file and stays as it was;
+the agent downloads again to see the new content.
+
 ---
 
 ## 7. API surfaces
@@ -729,12 +765,15 @@ uses.
 
 | Tool | Behavior |
 |---|---|
-| `list_artifacts` | List artifacts in a workspace. Same state-filter listing option as REST (§7.1): defaults to `RECORDED`, other states requestable. |
+| `list_artifacts` | List artifacts in a workspace. Same state-filter listing option as REST (§7.1): defaults to `RECORDED`, other states requestable. Each entry carries its `revision` (§2.2). |
 | `download_artifact` | Object → volume. Presign **GET** (`attachment`, §6.5); `cairn-download` sidecar mounts the volume at `/mnt/cairn/ws` (§4.4) and writes to `/mnt/cairn/ws/<path>`. Read direction, single sidecar, no core-register step. **The destination directory must already exist** — the agent prepares it first (§7.5.1). |
 | `upload_artifact` | Volume → object, **new** artifact. **Two sidecars** (stat/hash then upload) in front of the staging + register core path, §6.4 / §7.3. Parent workspace must exist (§7.5). |
 | `update_artifact` | Volume → object, replaces an **existing** artifact's bytes. Same two-sidecar flow as upload (§6.4) but calls the **update** core function. Parent workspace must exist (§7.5). |
 | `delete_artifact` | **Deletes the artifact row** (from `RECORDED` or `MISSING_OBJECT`); the object is reclaimed later by the GC (§8.2.1). Idempotent. |
 | `rename_artifact` | Updates an artifact's name (pure DB update). |
+| `read_text_artifact` | Object → tool result, for a **plain text** artifact (§7.6.1). Returns a range of lines plus the `revision` they belong to. No sidecar (§6.6). See §7.6.3. |
+| `create_text_artifact` | Tool call → object, a **new** artifact from content sent in the call. The name must be free. No sidecar (§6.6). See §7.6.5. |
+| `edit_text_artifact` | Applies an ordered list of exact-text replacements to an existing text artifact, guarded by a compare-and-swap on `revision` (§7.5.2). No sidecar (§6.6). See §7.6.4. |
 | `list_workspaces` | Read-only. Lists workspaces the agent can use. |
 | `get_workspace` | Read-only. Confirms a workspace exists and reports its `VolumeState` (whether the volume is ready to mount). Deliberately **not** the mount count the REST fetch returns (§7.1): an agent never tears a volume down — that is the operator's job — so the count is a number it could do nothing with. |
 
@@ -797,7 +836,7 @@ cannot drift. They are **not** a single uniform "one transfer engine," though �
 the front-ends differ by more than addressing:
 
 - **Addressing / caller** — REST: IDs, operator; MCP: names→IDs, agent.
-- **Two upload families, by where the bytes live** —
+- **Three upload families, by where the bytes live** —
   - *Staging-based (REST only)*: "Generate staging PUT URL" + "Register/Update
     artifact from staging" (§6.1). The caller already holds the bytes **outside a
     volume** and computes size + SHA-256 locally, so **no stat/hash sidecar**.
@@ -807,6 +846,10 @@ the front-ends differ by more than addressing:
     minted (§6.4). Both surfaces run the same two-sidecar flow; they differ only in
     addressing/caller. The stat/hash sidecar is a property of the **volume-based**
     path, not of MCP specifically.
+  - *Inline text (MCP only)*: `create_text_artifact` / `edit_text_artifact`. The bytes
+    arrive **in the tool call**, so there is no stat/hash sidecar and no presigned
+    URL — the service stages the object itself and calls the same register/update
+    core (§6.6).
 - **Download symmetry holds** — MCP `download_artifact` and the REST "Load artifact
   → volume" endpoint are both a single presigned-**GET** sidecar (`attachment`,
   §6.5); no stat step is needed for reads (a GET binds no size/hash up front).
@@ -897,12 +940,105 @@ On a mid-transfer failure the error is returned to the agent; the sidecar does
 **no** cleanup (a partial file may remain in the volume — acceptable, the volume is
 disposable scratch, §0).
 
-#### 7.5.2 Single-artifact concurrency: last-writer-wins
-Concurrent `update_artifact` (or update/register racing on the same name) is
-**last-writer-wins**. Each writer stages and `CopyObject`s to its **own new key**
-(§6.3), then updates the row; the final row update decides the winner. The loser's
-new object is immediately unreferenced and is reaped as an aged final-object with
-no row (§8.2.1 item 2). No optimistic locking / version column.
+#### 7.5.2 Single-artifact concurrency: revisions and compare-and-swap
+Every content write repoints the artifact row at a **new** object key (§6.3), so the
+row update is the one point every writer passes through. That is where concurrency is
+decided, and the two kinds of writer use it differently:
+
+- **Whole-file replace is last-writer-wins.** `update_artifact` and the REST content
+  updates replace the entire content, so the last row update deciding the winner is
+  the intent. Each writer stages and `CopyObject`s to its **own new key**, then updates
+  the row; the loser's object is immediately unreferenced and is reaped as an aged
+  final object with no row (§8.2.1 item 2).
+- **Edit is compare-and-swap.** An edit changes *part* of the content, so
+  last-writer-wins would silently drop a concurrent writer's change — a lost update.
+  `edit_text_artifact` (§7.6.4) therefore writes only if the row still holds the
+  revision it read.
+
+**Invariants.** The compare-and-swap rests on three, which every write path upholds:
+
+1. **A key's bytes never change.** Every content write goes to a new key (§6.2, §6.3),
+   and cairn is the sole credential holder (§5.1), so nothing else writes to the
+   bucket.
+2. **`Revision` and `ObjectKey` change together, in one statement.** Every row update
+   that changes `object_key` sets `revision = revision + 1` in the same `UPDATE` —
+   whole-file replace included — and no other statement touches either column.
+3. **`Revision` only goes up.** Nothing lowers or resets it, including the
+   `MISSING_OBJECT → RECORDED` restore. Otherwise it could go 5 → 6 → 5, and a stale
+   `WHERE revision = 5` would wrongly pass.
+
+Together they mean revision *r* always names the same key *K*, and *K* always holds
+the same bytes. "The row still says revision *r*" is therefore the same statement as
+"the content I read is still the current content" — **checking the revision is
+checking the content.**
+
+**The edit timeline:**
+```
+1. Load the row               → revision r, object_key K
+   base_revision given and r ≠ base_revision → conflict error now (fail fast only)
+2. GET K                      → revision r's bytes (a failed GET: see "reaper race" below)
+3. Apply the edits in memory  → a miss or multi-match is an error, no retry (§7.6.4)
+4. PutObject to staging → UpdateArtifactContent: size cap, sniff, CopyObject to new key K2
+5. UPDATE artifact
+     SET object_key = K2, revision = revision + 1, mime_type, size, state
+     WHERE id = ? AND revision = r          ← the only compare that counts
+6. 1 row  → done; the new revision is r + 1
+   0 rows → another writer committed after step 1. K2 is orphaned (§8.2.1 item 2).
+            no base_revision: back to step 1, textMaxAttempts in total (default 3)
+            base_revision:    conflict error — the revision only goes up, so a
+                              retry can never match
+```
+
+**The compare lives in the `UPDATE`, not in a check before it.**
+- Any check made in code before the `UPDATE` leaves a gap: another writer can commit
+  between the check and the write.
+- In the `WHERE` clause, Postgres compares and writes in one step. At the default
+  isolation level (`READ COMMITTED`), a second `UPDATE` on the same row waits for the
+  first to commit, then re-evaluates its `WHERE` against the new row version, so
+  exactly one writer wins.
+- Re-reading the object store before the write adds nothing: by invariant 1, *K*'s
+  bytes are the ones the edits were applied to. Only the row can say whether *K* is
+  still current.
+- Step 1's check only saves work; step 5's `WHERE` is the guard. No lock is held
+  across the object-store calls.
+
+**The reaper race in step 2.** The reaper ages an object by when it was *written*, not
+by when it lost its row (§8.2.1). So if another writer commits between steps 1 and 2,
+*K* is already an old, unreferenced object, and the next sweep may delete it before the
+GET lands. A failed GET is therefore checked against the row: if the row has moved off
+*K*, the failure counts as a conflict and the edit goes back to step 1; otherwise the
+failure stands. `read_text_artifact` does the same, restarting its read from the newer
+row, so the content it returns always belongs to the revision it reports.
+
+The design does **not** need the revision to stay put between steps 1 and 5. It
+detects a change and refuses the write, so a change costs only a retry. That is the
+trade-off of optimistic locking: cheap when conflicts are rare, which is the expected
+case for a text artifact a few participants edit now and then.
+
+**Where it lands in code.** `UpdateArtifactObject` takes an optional expected
+revision. When it is set, the update's `Where` gains `AND revision = ?`, and
+`RowsAffected == 0` returns a typed conflict error. Loading the entry before the update
+(which the function does to validate the state transition) is not a compare on its
+own — the `WHERE` is. Whole-file replace passes no expected revision.
+
+**Strict mode vs. the default.**
+- With `base_revision`, an edit fails if anything changed since the agent's read — the
+  same contract as a coding agent's "file modified since read".
+- Without it, the edit's own anchors are the guard, like `git apply`: a retry
+  re-applies the edits to the newer content and succeeds only if every `old_text`
+  still matches exactly once. A concurrent change elsewhere in the file lets the edit
+  through; a change to the text it targets fails it legibly. An agent whose edit
+  depends on the rest of the file staying unchanged passes `base_revision`.
+
+**Rename and description updates** touch neither `object_key` nor `revision`, so they
+never conflict with an edit.
+
+**Not chosen.**
+- **Object-store versioning** keeps history, but does not stop two writers who both
+  read v1 from both writing — it offers no single point to compare at.
+- **Locks.** A row lock held across the object-store calls means long transactions,
+  and a lock held by an agent needs expiry for when the agent dies — more machinery
+  for a rare case.
 
 #### 7.5.3 Upload read-path semantics (source file)
 The read-side counterpart to §7.5.1. Applies to **every volume-based upload/update**
@@ -937,6 +1073,112 @@ omitting them.
 **not** the integrity boundary — the checksum-bound PUT (§6.4) is. The size/hash
 feed the PUT URL, so a source that changes after this stat still fails closed at
 upload time (§6.4 TOCTOU).
+
+### 7.6 Text artifact tools
+`read_text_artifact`, `create_text_artifact`, and `edit_text_artifact` read, create,
+and edit **plain text** artifacts directly, with the content carried in the tool call
+(§6.6). The edit model is the one coding agents already use on files: **exact-text
+replacement, anchored on the text itself, never on line numbers.** Line numbers shift
+as other participants edit, and models count them unreliably; a text anchor that no
+longer matches fails loudly instead of landing in the wrong place.
+
+Common to all three:
+- **Parent workspace must exist** (§7.5).
+- **Volume state does not matter.** These tools never touch the volume, so they work
+  on a workspace whose `VolumeState` is `NONE`.
+- **`MISSING_OBJECT` is refused** by read and edit — there is no object behind the
+  row. Recovery stays with `update_artifact` (§2.2.1).
+
+#### 7.6.1 What counts as plain text
+One check, applied by all three tools to the stored content **and** to content the
+agent supplies (`content`, every `new_text`):
+
+- valid **UTF-8**;
+- **no control characters** except tab, LF, and CR as part of CRLF;
+- **consistent line endings** — all LF or all CRLF.
+
+Failing it is a legible "not a plain text artifact" error; the artifact is still
+reachable through `download_artifact`. A UTF-8 check alone is **not** enough: NUL and
+ESC are valid UTF-8. The control-character rule exists because a model can neither
+see nor reliably reproduce those bytes, so an edit anchored across one could never
+match — refusing the artifact up front is clearer than a stream of "not found" errors.
+
+**A MIME allowlist is the cheap first gate.** Read and edit check the entry's stored
+`MIMEType` before fetching anything: `text/*`, any `+json` or `+xml` type, and a short
+list of `application/*` text types (`json`, `x-ndjson`, `xml`, `javascript`,
+`x-subrip`, `yaml`, …). Parameters such as `; charset=utf-8` are ignored. Create checks
+the same allowlist against an in-memory sniff of the content, so the text tools never
+create an artifact they would then refuse to read. The allowlist is **not** the
+authority — the sniffer reports content holding ESC or form feed as `text/plain`, and a
+few `+xml` types name ZIP containers — so the content check above still decides. MIME
+stays advisory metadata everywhere else (§6).
+
+#### 7.6.2 Line endings
+The agent always works in LF.
+
+- `read_text_artifact` returns LF text and reports `line_ending` (`LF` | `CRLF`).
+- `edit_text_artifact` matches against an LF copy of the content, converts any CRLF in
+  `old_text` / `new_text` to LF, and writes the result back in the artifact's own line
+  ending.
+- `create_text_artifact` stores the content as given (it must still pass §7.6.1).
+
+So an agent never has to type a CR to edit a CRLF file, and an edit never changes a
+file's line-ending style.
+
+#### 7.6.3 `read_text_artifact`
+| Param | Meaning |
+|---|---|
+| `workspace_name`, `artifact_name` | The artifact, by name (§3). |
+| `offset` | Optional. 1-based first line to return; default `1`. |
+| `limit` | Optional. Max number of lines to return; default all. |
+| `line_numbers` | Optional, default `false`. See below. |
+
+Returns `content`, `start_line`, `total_lines`, `revision`, and `line_ending`.
+`content` is the **raw text** of the requested lines, with no prefixes, so what the
+agent copies into `old_text` is exactly the artifact's text. `revision` is the value a
+strict edit passes as `base_revision` (§7.5.2).
+
+With `line_numbers: true`, each line comes back as *line number, one tab, the line's
+text*. No padding is promised; the tab is the separator. The tool description tells
+the agent to remove everything up to and including the first tab before copying text
+into `old_text`. Raw text is the default because cairn cannot assume its agents were
+trained to strip such a prefix, and a leftover prefix makes every edit fail with "not
+found".
+
+#### 7.6.4 `edit_text_artifact`
+| Param | Meaning |
+|---|---|
+| `workspace_name`, `artifact_name` | The artifact, by name (§3). |
+| `edits` | Ordered, non-empty list of `{old_text, new_text, replace_all}`. |
+| `base_revision` | Optional. Strict mode: fail unless the artifact is still at this revision (§7.5.2). |
+
+Rules:
+- Edits apply **in order**, each to the result of the one before. A later edit's
+  `old_text` must match the text as the earlier edits left it.
+- **All or nothing.** If any edit fails, nothing is written.
+- Matching is **exact substring** — no regex, no fuzzy matching, no whitespace
+  trimming. A single wrong space is a miss.
+- `old_text` must be non-empty and differ from `new_text`.
+- `old_text` must match **exactly once**, unless `replace_all` is set, which replaces
+  every occurrence. Zero matches is an error even with `replace_all`; multiple matches
+  without it is an error too. The tool never guesses.
+- Errors name the edit and the reason, e.g. *"edit 2: found 3 times; add more
+  surrounding text or set replace_all"*.
+- The result must pass §7.6.1 and fit under `maxTextSize` (§6.6).
+
+Returns the new `revision`. Concurrency — the retry loop, the compare-and-swap, and
+what `base_revision` changes — is §7.5.2.
+
+#### 7.6.5 `create_text_artifact`
+| Param | Meaning |
+|---|---|
+| `workspace_name` | The workspace to record the new artifact in. |
+| `artifact_name` | Must not already be taken in this workspace. |
+| `content` | The full text. Must pass §7.6.1 and fit under `maxTextSize` (§6.6). |
+| `description` | Optional. |
+
+Name availability is pre-checked as a fail-fast; the `(WorkspaceID, Name)` constraint
+is the real guard (§7.5). Returns revision `1`.
 
 ---
 
@@ -994,8 +1236,10 @@ runs). Item 3 is a cairn-side DB update.
 2. **Aged final objects with no backing row** — a final-prefix object referenced by
    no artifact row, aged past grace. Causes: a **purged** artifact/workspace whose
    row was deleted (§4.1) — the normal case now; a *failed register/update*
-   (`CopyObject` succeeded, insert/row-update did not); or an *update orphan* (§6.3
-   flipped `ObjectKey` to a new key). One remedy — reclaimed by the reap Task.
+   (`CopyObject` succeeded, insert/row-update did not); an *update orphan* (§6.3
+   flipped `ObjectKey` to a new key); or an *edit that lost the compare-and-swap*
+   (§7.5.2 — its new key was copied, but the guarded row update matched no row). One
+   remedy — reclaimed by the reap Task.
 
 3. **Artifact row with a missing object** — a `RECORDED` row whose `ObjectKey`
    resolves to no object. Detected for free by the same join. A **data-loss
@@ -1103,6 +1347,14 @@ not fatal: the level-triggered sweep simply retries them next run.
   chaining tool → save → load across a pipeline.
 - **`resources/read` exposure of artifacts** — per-tool opt-in, now cleaner with
   an object store + DB behind it; not yet revisited.
+- **Expected-revision guard on whole-file replace** — `update_artifact` and the REST
+  content updates stay last-writer-wins (§7.5.2). The `Revision` column would let them
+  take an optional expected revision later; not needed yet.
+- **Editing files in the volume directly** — the text tools (§7.6) edit artifacts in
+  the object store. Editing a file in the volume would still need a sidecar, since only
+  a container can reach it.
+- **Editing non-text content** — the edit model is exact-text replacement over plain
+  text (§7.6.1); other content is replaced whole through `update_artifact`.
 
 **Known prerequisites (not deferred — required before/with implementation):**
 - ~~**goutils `GeneratePresignedGetURL` must accept response overrides**~~ —

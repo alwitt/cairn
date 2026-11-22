@@ -350,14 +350,32 @@ type Database interface {
 		Also restores the entry to `RECORDED`, so re-uploading the bytes of an artifact
 		quarantined as `MISSING_OBJECT` brings it back into service.
 
+		The same update raises the entry's revision by one. The increment is computed in SQL
+		rather than from the entry read beforehand: two unguarded writers that both read
+		revision N would otherwise both write N+1, and one revision would name two different
+		objects (see DESIGN §7.5.2).
+
+		With an expected revision, the update is a compare-and-swap. The revision check is part
+		of the update's own WHERE clause rather than a separate read before it, so there is no
+		window between the compare and the write. An entry that has moved past the expected
+		revision is left untouched, and an `ArtifactRevisionConflictError` is returned. Without
+		an expected revision, the update is last-writer-wins.
+
 			@param ctx context.Context - execution context
 			@param artifactID string - artifact ID
 			@param objectKey string - the new backing object key
 			@param mimeType string - server-sniffed content type of the new object
 			@param size int64 - size of the new object in bytes
+			@param expectedRevision *int64 - if set, only update the entry while it is still at
+			    this revision
 	*/
 	UpdateArtifactObject(
-		ctx context.Context, artifactID string, objectKey string, mimeType string, size int64,
+		ctx context.Context,
+		artifactID string,
+		objectKey string,
+		mimeType string,
+		size int64,
+		expectedRevision *int64,
 	) error
 
 	/*

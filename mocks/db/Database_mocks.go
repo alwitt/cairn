@@ -1175,16 +1175,16 @@ func (_c *Database_UpdateArtifactName_Call) RunAndReturn(run func(ctx context.Co
 }
 
 // UpdateArtifactObject provides a mock function for the type Database
-func (_mock *Database) UpdateArtifactObject(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64) error {
-	ret := _mock.Called(ctx, artifactID, objectKey, mimeType, size)
+func (_mock *Database) UpdateArtifactObject(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64, expectedRevision *int64) error {
+	ret := _mock.Called(ctx, artifactID, objectKey, mimeType, size, expectedRevision)
 
 	if len(ret) == 0 {
 		panic("no return value specified for UpdateArtifactObject")
 	}
 
 	var r0 error
-	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string, string, int64) error); ok {
-		r0 = returnFunc(ctx, artifactID, objectKey, mimeType, size)
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, string, string, int64, *int64) error); ok {
+		r0 = returnFunc(ctx, artifactID, objectKey, mimeType, size, expectedRevision)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -1202,11 +1202,12 @@ type Database_UpdateArtifactObject_Call struct {
 //   - objectKey string
 //   - mimeType string
 //   - size int64
-func (_e *Database_Expecter) UpdateArtifactObject(ctx interface{}, artifactID interface{}, objectKey interface{}, mimeType interface{}, size interface{}) *Database_UpdateArtifactObject_Call {
-	return &Database_UpdateArtifactObject_Call{Call: _e.mock.On("UpdateArtifactObject", ctx, artifactID, objectKey, mimeType, size)}
+//   - expectedRevision *int64
+func (_e *Database_Expecter) UpdateArtifactObject(ctx interface{}, artifactID interface{}, objectKey interface{}, mimeType interface{}, size interface{}, expectedRevision interface{}) *Database_UpdateArtifactObject_Call {
+	return &Database_UpdateArtifactObject_Call{Call: _e.mock.On("UpdateArtifactObject", ctx, artifactID, objectKey, mimeType, size, expectedRevision)}
 }
 
-func (_c *Database_UpdateArtifactObject_Call) Run(run func(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64)) *Database_UpdateArtifactObject_Call {
+func (_c *Database_UpdateArtifactObject_Call) Run(run func(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64, expectedRevision *int64)) *Database_UpdateArtifactObject_Call {
 	_c.Call.Run(func(args mock.Arguments) {
 		var arg0 context.Context
 		if args[0] != nil {
@@ -1228,12 +1229,17 @@ func (_c *Database_UpdateArtifactObject_Call) Run(run func(ctx context.Context, 
 		if args[4] != nil {
 			arg4 = args[4].(int64)
 		}
+		var arg5 *int64
+		if args[5] != nil {
+			arg5 = args[5].(*int64)
+		}
 		run(
 			arg0,
 			arg1,
 			arg2,
 			arg3,
 			arg4,
+			arg5,
 		)
 	})
 	return _c
@@ -1244,7 +1250,7 @@ func (_c *Database_UpdateArtifactObject_Call) Return(err error) *Database_Update
 	return _c
 }
 
-func (_c *Database_UpdateArtifactObject_Call) RunAndReturn(run func(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64) error) *Database_UpdateArtifactObject_Call {
+func (_c *Database_UpdateArtifactObject_Call) RunAndReturn(run func(ctx context.Context, artifactID string, objectKey string, mimeType string, size int64, expectedRevision *int64) error) *Database_UpdateArtifactObject_Call {
 	_c.Call.Return(run)
 	return _c
 }

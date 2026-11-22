@@ -109,6 +109,20 @@ func TestInstallDefaultServerConfigValues(t *testing.T) {
 		assert.Greater(
 			config.Maintenance.OrphanedObjectAgeOutSec, config.API.Server.Timeouts.WriteTimeout,
 		)
+		// A text artifact is still an artifact, so its cap can never exceed the object cap.
+		assert.LessOrEqual(
+			config.Artifact.Storage.MaxTextSizeBytes, config.Artifact.Storage.MaxObjectSizeBytes,
+		)
+	})
+
+	// Case 2b: the text tool defaults land, and a text edit gets at least one retry.
+	t.Run("installs the text tool defaults", func(t *testing.T) {
+		assert := assert.New(t)
+
+		config := readUnitTestDefaultConfig(t)
+
+		assert.Equal(int64(1024*1024), config.Artifact.Storage.MaxTextSizeBytes)
+		assert.Equal(3, config.Artifact.Storage.TextMaxAttempts)
 	})
 
 	// Case 3: the two settings whose default is a security posture rather than a tuning choice.

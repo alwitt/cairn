@@ -8,6 +8,8 @@ import "github.com/alwitt/goutils"
 // WorkspaceMangerError encountered error operating the workspace manager
 type WorkspaceMangerError struct{ goutils.BaseError }
 
+var _ error = *new(WorkspaceMangerError)
+
 // NewWorkspaceMangerError build a WorkspaceMangerError, optionally capturing the call stack.
 func NewWorkspaceMangerError(message string, core error, getCallStack bool) WorkspaceMangerError {
 	base := goutils.BaseError{Name: "WorkspaceMangerError", Message: message, Core: core}
@@ -23,6 +25,8 @@ func NewWorkspaceMangerError(message string, core error, getCallStack bool) Work
 // ArtifactMangerError encountered error operating the artifact manager
 type ArtifactMangerError struct{ goutils.BaseError }
 
+var _ error = *new(ArtifactMangerError)
+
 // NewArtifactMangerError build a ArtifactMangerError, optionally capturing the call stack.
 func NewArtifactMangerError(message string, core error, getCallStack bool) ArtifactMangerError {
 	base := goutils.BaseError{Name: "ArtifactMangerError", Message: message, Core: core}
@@ -30,6 +34,30 @@ func NewArtifactMangerError(message string, core error, getCallStack bool) Artif
 		base.Stack = goutils.GetCallStack(1)
 	}
 	return ArtifactMangerError{BaseError: base}
+}
+
+// ArtifactRevisionConflictError a guarded artifact content update found the artifact no
+// longer at the revision it expected.
+//
+// Raised when a content update carries an expected revision and the row has moved past it,
+// so the update was refused rather than written over a change it never saw (see DESIGN
+// §7.5.2). Its core is a `goutils.ConsistencyError`, so `errors.As` against either type finds
+// it: a caller that retries on a conflict looks for this type, while generic handling treats it
+// like any other precondition the caller can act on.
+type ArtifactRevisionConflictError struct{ goutils.BaseError }
+
+var _ error = *new(ArtifactRevisionConflictError)
+
+// NewArtifactRevisionConflictError build a ArtifactRevisionConflictError, optionally capturing
+// the call stack.
+func NewArtifactRevisionConflictError(
+	message string, core error, getCallStack bool,
+) ArtifactRevisionConflictError {
+	base := goutils.BaseError{Name: "ArtifactRevisionConflictError", Message: message, Core: core}
+	if getCallStack {
+		base.Stack = goutils.GetCallStack(1)
+	}
+	return ArtifactRevisionConflictError{BaseError: base}
 }
 
 // ======================================================================================
@@ -42,6 +70,8 @@ func NewArtifactMangerError(message string, core error, getCallStack bool) Artif
 // manager rejecting the work itself. A manager error raised mid-operation still surfaces
 // nested inside this one, so `errors.As` against either finds what it is looking for.
 type ArtifactOperatorError struct{ goutils.BaseError }
+
+var _ error = *new(ArtifactOperatorError)
 
 // NewArtifactOperatorError build a ArtifactOperatorError, optionally capturing the call stack.
 func NewArtifactOperatorError(
@@ -66,6 +96,8 @@ func NewArtifactOperatorError(
 // them apart (see DESIGN §8.3.2).
 type MaintenanceError struct{ goutils.BaseError }
 
+var _ error = *new(MaintenanceError)
+
 // NewMaintenanceError build a MaintenanceError, optionally capturing the call stack.
 func NewMaintenanceError(message string, core error, getCallStack bool) MaintenanceError {
 	base := goutils.BaseError{Name: "MaintenanceError", Message: message, Core: core}
@@ -81,6 +113,8 @@ func NewMaintenanceError(message string, core error, getCallStack bool) Maintena
 // BootStrapError application boot strap error
 type BootStrapError struct{ goutils.BaseError }
 
+var _ error = *new(BootStrapError)
+
 // NewBootStrapError builds a BootStrapError, optionally capturing the call stack.
 func NewBootStrapError(message string, core error, getCallStack bool) BootStrapError {
 	base := goutils.BaseError{Name: "BootStrapError", Message: message, Core: core}
@@ -92,6 +126,8 @@ func NewBootStrapError(message string, core error, getCallStack bool) BootStrapE
 
 // ShutdownError application shutdown error
 type ShutdownError struct{ goutils.BaseError }
+
+var _ error = *new(ShutdownError)
 
 // NewShutdownError builds a ShutdownError, optionally capturing the call stack.
 func NewShutdownError(message string, core error, getCallStack bool) ShutdownError {
